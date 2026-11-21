@@ -513,7 +513,7 @@ class VeAutotuner {
       runningVeFilter,
       detail: switch (mode) {
         AutotuneMode.live =>
-          'ЭБУ всё ещё работает с $ran здесь; в таблице сейчас $now',
+          'ЭБУ всё ещё работает с $ran здесь; в таблице сейчас $now (ECU still running)',
         AutotuneMode.replay =>
           'Записано при VE $ran здесь, где сейчас в таблице $now',
       },
@@ -611,7 +611,7 @@ class VeAutotuner {
             lambda > settings.lambdaMax;
         return dead
             ? AutotuneOutcome.rejected(filter,
-                detail: 'Показание смеси ${lambda.toStringAsFixed(2)} лямбда вне допустимого диапазона'
+                detail: 'Показание смеси ${lambda.toStringAsFixed(2)} лямбда вне допустимого диапазона (not plausible)'
                     '')
             : null;
 
