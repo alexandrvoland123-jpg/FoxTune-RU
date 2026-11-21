@@ -67,7 +67,7 @@ void main() {
       final tune = seeded();
       choose(tune, 'enableAemXSeries', 'no');
       choose(tune, 'afr_hwChannel', 'NONE');
-      expect(arm(tune).readiness.reason, contains('No O2 sensor input'));
+      expect(arm(tune).readiness.reason, contains('Не настроен вход датчика O2'));
     });
 
     test('refuses an analog input calibrated as a narrowband', () {
