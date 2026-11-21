@@ -36,7 +36,7 @@ String? _unreadableFilter(IniVeAnalyze config) {
     if (filter.channel.isEmpty ||
         filter.operator == null ||
         filter.value == null) {
-      return 'Фильтр «${filter.displayLabel}» ("${filter.displayLabel}") из определения не удалось прочитать, поэтому он никогда не отклонял бы отсчёты. Автонастройка остаётся выключенной, а не работает без него.'
+      return 'Фильтр «${filter.displayLabel}» из определения не удалось прочитать, поэтому он никогда не отклонял бы отсчёты. Автонастройка остаётся выключенной, а не работает без него.'
           ''
           '';
     }
@@ -86,7 +86,7 @@ String? _sensorProblem(TuneState tune, TuneValueResolver resolver) {
   }
 
   if (input.optionLabel?.toUpperCase() == 'NONE') {
-    return 'Не настроен вход датчика O2 - ни широкополосный по CAN, ни аналоговый - поэтому нет показания смеси для настройки. (No O2 sensor input)'
+    return 'Не настроен вход датчика O2 - ни широкополосный по CAN, ни аналоговый - поэтому нет показания смеси для настройки.'
         '';
   }
 
