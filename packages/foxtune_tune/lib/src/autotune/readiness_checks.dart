@@ -36,7 +36,7 @@ String? _unreadableFilter(IniVeAnalyze config) {
     if (filter.channel.isEmpty ||
         filter.operator == null ||
         filter.value == null) {
-      return 'Фильтр «${filter.displayLabel}» из определения не удалось прочитать, поэтому он никогда не отклонял бы отсчёты. Автонастройка остаётся выключенной, а не работает без него.'
+      return 'Фильтр «${filter.displayLabel}» ("${filter.displayLabel}") из определения не удалось прочитать, поэтому он никогда не отклонял бы отсчёты. Автонастройка остаётся выключенной, а не работает без него.'
           ''
           '';
     }
@@ -59,7 +59,7 @@ String? _sensorProblem(TuneState tune, TuneValueResolver resolver) {
   if (egoType != null && egoType.isEnumerated) {
     final label = egoType.optionLabel;
     if (label == null || label.toLowerCase().contains('wide')) return null;
-    return 'Датчик O2 установлен как «$label». Для автонастройки нужен широкополосный: узкополосный сообщает только «богаче или беднее» стехиометрии, поэтому по его показаниям нельзя сказать, насколько смесь отличается от цели.'
+    return 'Датчик O2 установлен как «$label». Для автонастройки нужен широкополосный (wideband): узкополосный (narrowband) сообщает только «богаче или беднее» стехиометрии, поэтому по его показаниям нельзя сказать, насколько смесь отличается от цели.'
         ''
         '';
   }
@@ -86,7 +86,7 @@ String? _sensorProblem(TuneState tune, TuneValueResolver resolver) {
   }
 
   if (input.optionLabel?.toUpperCase() == 'NONE') {
-    return 'Не настроен вход датчика O2 - ни широкополосный по CAN, ни аналоговый - поэтому нет показания смеси для настройки.'
+    return 'Не настроен вход датчика O2 - ни широкополосный по CAN, ни аналоговый - поэтому нет показания смеси для настройки. (No O2 sensor input)'
         '';
   }
 
@@ -102,7 +102,7 @@ String? _sensorProblem(TuneState tune, TuneValueResolver resolver) {
   final points = '${_n(afr1)} AFR при ${_n(v1)} В, ${_n(afr2)} AFR при ${_n(v2)} В'
       '';
   if (slope <= 0) {
-    return 'Датчик O2 откалиброван как узкополосный ($points). Для автонастройки нужен широкополосный: узкополосный сообщает только «богаче или беднее» стехиометрии, поэтому по его показаниям нельзя сказать, насколько смесь отличается от цели.'
+    return 'Датчик O2 откалиброван как узкополосный (narrowband, $points). Для автонастройки нужен широкополосный (wideband): узкополосный сообщает только «богаче или беднее» стехиометрии, поэтому по его показаниям нельзя сказать, насколько смесь отличается от цели.'
         ''
         ''
         '';
@@ -148,7 +148,7 @@ String? _displayUnitAxes(
         final inMetric = compiled.evaluate(metricResolve);
         if (shown != inMetric) {
           final label = _dialogLabel(tune.definition, switchName);
-          return 'Ось таблицы «${view.table.title}» показана в имперских единицах, тогда как ЭБУ сообщает положение двигателя на ней в метрических, поэтому показания были бы отнесены не к тем ячейкам. Для автонастройки задайте «$label» в значение Metric.'
+          return 'Ось таблицы «${view.table.title}» показана в имперских единицах (Imperial), тогда как ЭБУ сообщает положение двигателя на ней в метрических, поэтому показания были бы отнесены не к тем ячейкам. Для автонастройки задайте «$label» в значение Metric.'
               ''
               ''
               '';
@@ -168,7 +168,7 @@ String? _longTermTrims(TuneState tune, TuneValueResolver resolver) {
   const name = 'ltft_correctionEnabled';
   final ltft = SettingView.of(tune, name, resolver: resolver);
   if (ltft?.optionLabel != 'yes') return null;
-  return 'Долговременные топливные коррекции накладываются поверх таблицы VE, и автонастройка их не видит. Выключите «${_dialogLabel(tune.definition, name)}», чтобы выполнить автонастройку.'
+  return 'Долговременные топливные коррекции накладываются поверх таблицы VE, и автонастройка их не видит. Выключите «${_dialogLabel(tune.definition, name)}» ("Apply Correction"), чтобы выполнить автонастройку.'
       ''
       '';
 }
