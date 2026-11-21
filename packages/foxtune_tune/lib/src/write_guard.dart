@@ -51,12 +51,12 @@ class WritePermission {
     }
     if (!definition.matchesSignature(reportedSignature)) {
       return WritePermission.refused(
-          'ЭБУ сообщает «$reportedSignature», а загруженное определение для «$expected». Смещениям страниц доверять нельзя.'
+          'ЭБУ сообщает «$reportedSignature», а загруженное определение для «$expected». Смещениям страниц доверять нельзя (cannot be trusted).'
           '');
     }
     if (!writeModeEnabled) {
       return const WritePermission.refused(
-          'Режим записи выключен. Включайте его осознанно, чтобы вносить изменения.');
+          'Режим записи выключен (Write mode is off). Включайте его осознанно, чтобы вносить изменения.');
     }
     return const WritePermission.granted();
   }
