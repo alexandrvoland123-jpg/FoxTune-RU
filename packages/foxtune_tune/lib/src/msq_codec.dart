@@ -1,0 +1,368 @@
+import 'package:foxtune_ini/foxtune_ini.dart';
+import 'package:xml/xml.dart';
+
+import 'temperature_scale.dart';
+import 'tune_state.dart';
+import 'value_resolver.dart';
+
+/// What happened while reading a `.msq`.
+class MsqImportResult {
+  const MsqImportResult({
+    required this.signature,
+    required this.applied,
+    required this.skipped,
+    required this.unknown,
+    this.converted = const [],
+  });
+
+  /// Signature declared by the file, if any.
+  final String? signature;
+
+  /// Constants that were written into the tune.
+  final int applied;
+
+  /// Constants this version could not convert, by name.
+  ///
+  /// Reported rather than silently ignored: a value that did not load is a
+  /// setting the user thinks they have and does not.
+  final List<String> skipped;
+
+  /// Names in the file that the loaded definition does not declare.
+  ///
+  /// Usually a tune from a different firmware version.
+  final List<String> unknown;
+
+  /// Temperatures saved in the other scale from the one the loaded definition
+  /// reads, converted on the way in, by name.
+  ///
+  /// A tune saved in Fahrenheit holds 212 where a Celsius definition means
+  /// 100. Written as they stand, those values would be wrong by a factor and
+  /// an offset - and nothing would say so, since both are in range. The file
+  /// says which scale each value is in, so converting is not a guess.
+  final List<String> converted;
+
+  bool get isClean => skipped.isEmpty && unknown.isEmpty;
+
+  @override
+  String toString() => 'MsqImportResult(applied: $applied, '
+      'skipped: ${skipped.length}, unknown: ${unknown.length})';
+}
+
+/// Thrown when a `.msq` cannot be applied to the loaded tune.
+class MsqException implements Exception {
+  MsqException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'MsqException: $message';
+}
+
+/// Reads and writes TunerStudio `.msq` tune files.
+///
+/// The format is XML holding values in **engineering units**, not raw bytes:
+/// a bits field is stored as its option label (`"Even fire"`), a scalar as a
+/// decimal, and an array as whitespace-separated values laid out in rows.
+/// Conversion therefore runs through the same scaling the editor uses,
+/// including expression-based scales.
+///
+/// Two-dimensional tables are written in ascending-axis order, lowest Y first,
+/// which is what TunerStudio writes - not display order. Firmware storage has
+/// row 0 at Y-Max, so rows invert on the way in and out; columns do not, since
+/// both the file and storage run ascending-X.
+abstract final class MsqCodec {
+  /// Namespace TunerStudio writes on the root element.
+  static const String namespace = 'http://www.msefi.com/:msq';
+
+  /// File format version FoxTune writes.
+  static const String fileFormat = '5.0';
+
+  /// Serialises [tune] as a `.msq` document.
+  ///
+  /// Written by hand rather than through an XML pretty-printer: the row layout
+  /// inside a table's text is meaningful to anyone reading the file, and a
+  /// pretty-printer collapses it onto one line.
+  static String encode(
+    TuneState tune, {
+    String author = 'FoxTune',
+    String tuneComment = '',
+    DateTime? writeDate,
+  }) {
+    final definition = tune.definition;
+    final resolver = TuneValueResolver(tune);
+    final signature = definition.identity.signature ?? '';
+    final out = StringBuffer()
+      ..writeln('<?xml version="1.0" encoding="ISO-8859-1"?>')
+      ..writeln('<msq xmlns="$namespace">')
+      ..writeln('<bibliography author="${_attr(author)}" '
+          'tuneComment="${_attr(tuneComment)}" '
+          'writeDate="${_attr((writeDate ?? DateTime.now()).toString())}"/>')
+      ..writeln('<versionInfo fileFormat="$fileFormat" '
+          'firmwareInfo="${_attr(signature)}" '
+          'nPages="${definition.constants.pageCount}" '
+          'signature="${_attr(signature)}"/>');
+
+    // PcVariables live in a page element with no number, matching TunerStudio.
+    out.writeln('<page>');
+    out.writeln('</page>');
+
+    for (final page in definition.constants.pages) {
+      final size = definition.constants.pageSizes[page.number - 1];
+      out.writeln('<page number="${page.number}" size="$size">');
+      for (final field in page.fields) {
+        _writeField(out, 'constant', field, page.number, tune, resolver);
+      }
+      out.writeln('</page>');
+    }
+
+    out.writeln('</msq>');
+    return out.toString();
+  }
+
+  static void _writeField(
+    StringBuffer out,
+    String elementName,
+    IniField field,
+    int page,
+    TuneState tune,
+    TuneValueResolver resolver,
+  ) {
+    switch (field) {
+      case IniBitsField():
+        final value = tune.readBits(page, field);
+        if (value == null) return;
+        final label = field.labelFor(value);
+        // Bits are stored as the quoted option label, not as a number.
+        final text = label == null ? '"$value"' : '"$label"';
+        out.writeln('<$elementName name="${_attr(field.name)}">'
+            '${_text(text)}</$elementName>');
+
+      case IniScalarField():
+        final raw = tune.readRaw(page, field);
+        final scale = resolver.valueOf(field.scale);
+        final translate = resolver.valueOf(field.translate);
+        if (raw == null || scale == null || translate == null) return;
+        final digits = field.digits ?? 0;
+        final value =
+            scaledFromRaw(raw, scale, translate).toStringAsFixed(digits);
+        out.writeln('<$elementName digits="$digits" '
+            'name="${_attr(field.name)}"'
+            '${field.units.isEmpty ? '' : ' units="${_attr(field.units)}"'}>'
+            '$value</$elementName>');
+
+      case IniArrayField():
+        final scale = resolver.valueOf(field.scale);
+        final translate = resolver.valueOf(field.translate);
+        if (scale == null || translate == null) return;
+
+        final digits = field.digits ?? 0;
+        final columns = field.isTable ? field.shape[1] : 1;
+        final rows = field.shape[0];
+
+        out.writeln('<$elementName cols="$columns" digits="$digits" '
+            'name="${_attr(field.name)}" rows="$rows"'
+            '${field.units.isEmpty ? '' : ' units="${_attr(field.units)}"'}>');
+        // Ascending-axis order, which is how TunerStudio writes arrays -
+        // lowest Y first, not display order. Storage runs the other way (row 0
+        // is Y-Max), hence the reverse iteration.
+        for (var r = rows - 1; r >= 0; r--) {
+          out.write('        ');
+          for (var c = 0; c < columns; c++) {
+            final index = field.isTable ? r * columns + c : r;
+            final raw = tune.readRaw(page, field, index);
+            final value =
+                raw == null ? 0.0 : scaledFromRaw(raw, scale, translate);
+            out
+              ..write(value.toStringAsFixed(digits))
+              ..write(' ');
+          }
+          out.writeln();
+        }
+        out.writeln('      </$elementName>');
+    }
+  }
+
+  /// Escapes a value for use inside a double-quoted attribute.
+  static String _attr(String value) => value
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;');
+
+  /// Escapes a value for use as element text.
+  static String _text(String value) => value
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
+
+  /// The signature a `.msq` was saved for, or `null` where it declares none.
+  ///
+  /// Which definition a tune needs has to be known before there is a
+  /// [TuneState] to read it into. Throws [MsqException] for a file that is
+  /// not a `.msq` at all.
+  static String? signatureOf(String xml) => _signatureIn(_root(xml))?.trim();
+
+  static XmlElement _root(String xml) {
+    final XmlDocument document;
+    try {
+      document = XmlDocument.parse(xml);
+    } on XmlException catch (e) {
+      throw MsqException('Not a valid XML document: ${e.message}');
+    }
+
+    final root = document.rootElement;
+    if (root.name.local != 'msq') {
+      throw MsqException(
+          'Root element is <${root.name.local}>, expected <msq>');
+    }
+    return root;
+  }
+
+  static String? _signatureIn(XmlElement root) =>
+      root.findElements('versionInfo').firstOrNull?.getAttribute('signature');
+
+  /// Reads a `.msq` into [into].
+  ///
+  /// Values are matched to the loaded definition **by name**, so a tune saved
+  /// from a different firmware version loads whatever still applies and reports
+  /// the rest rather than shifting everything by an offset.
+  ///
+  /// Set [requireSignatureMatch] to refuse a file whose signature differs.
+  static MsqImportResult decode(
+    String xml,
+    TuneState into, {
+    bool requireSignatureMatch = true,
+  }) {
+    final root = _root(xml);
+    final signature = _signatureIn(root);
+
+    final expected = into.definition.identity.signature;
+    if (requireSignatureMatch) {
+      if (signature == null) {
+        throw MsqException('В файле не указана сигнатура.');
+      }
+      if (expected != null && signature.trim() != expected) {
+        throw MsqException(
+            'Этот тюн для «$signature», а загруженное определение для «$expected». Загрузка поместит значения по неверным смещениям.'
+            '');
+      }
+    }
+
+    final resolver = TuneValueResolver(into);
+    var applied = 0;
+    final skipped = <String>[];
+    final unknown = <String>[];
+    final converted = <String>[];
+
+    for (final element in root.descendantElements) {
+      if (element.name.local != 'constant') continue;
+      final name = element.getAttribute('name');
+      if (name == null) continue;
+
+      final located = into.locate(name);
+      if (located == null) {
+        unknown.add(name);
+        continue;
+      }
+
+      final convert =
+          _temperatureConversion(element.getAttribute('units'), located.field);
+      final ok = _applyField(into, located.page, located.field,
+          element.innerText, resolver, convert);
+      if (ok) {
+        applied++;
+        if (convert != null) converted.add(name);
+      } else {
+        skipped.add(name);
+      }
+    }
+
+    return MsqImportResult(
+      signature: signature,
+      applied: applied,
+      skipped: skipped,
+      unknown: unknown,
+      converted: converted,
+    );
+  }
+
+  /// How to bring a value saved in [savedUnits] into [field]'s units, where
+  /// the two are different temperature scales; `null` where nothing needs
+  /// converting.
+  static double Function(double)? _temperatureConversion(
+      String? savedUnits, IniField field) {
+    final units = switch (field) {
+      IniScalarField(:final units) || IniArrayField(:final units) => units,
+      IniBitsField() => null,
+    };
+    if (savedUnits == null || units == null) return null;
+    final from = TemperatureScale.of(savedUnits);
+    final to = TemperatureScale.of(units);
+    if (from == null || to == null || from == to) return null;
+    return from == TemperatureScale.celsius
+        ? (value) => value * 1.8 + 32
+        : (value) => (value - 32) / 1.8;
+  }
+
+  static bool _applyField(TuneState tune, int page, IniField field, String text,
+      TuneValueResolver resolver, double Function(double)? convert) {
+    switch (field) {
+      case IniBitsField():
+        final label = text.trim().replaceAll('"', '');
+        var index = field.options.indexOf(label);
+        if (index < 0) {
+          // Some writers store the numeric value instead of the label.
+          final numeric = int.tryParse(label);
+          if (numeric == null) return false;
+          index = numeric;
+        }
+        // Preserve the neighbouring bits packed into the same byte.
+        tune.writeBits(page, field, index);
+        return true;
+
+      case IniScalarField():
+        final saved = double.tryParse(text.trim());
+        if (saved == null) return false;
+        final value = convert == null ? saved : convert(saved);
+        final scale = resolver.valueOf(field.scale);
+        final translate = resolver.valueOf(field.translate);
+        if (scale == null || translate == null || scale == 0) return false;
+        tune.writeRaw(page, field, rawFromScaled(value, scale, translate));
+        return true;
+
+      case IniArrayField():
+        final scale = resolver.valueOf(field.scale);
+        final translate = resolver.valueOf(field.translate);
+        if (scale == null || translate == null || scale == 0) return false;
+
+        final numbers = text
+            .split(RegExp(r'\s+'))
+            .where((s) => s.isNotEmpty)
+            .map(double.tryParse)
+            .toList();
+        if (numbers.any((n) => n == null)) return false;
+
+        final columns = field.isTable ? field.shape[1] : 1;
+        final rows = field.isTable ? field.shape[0] : field.shape[0];
+        if (numbers.length != rows * columns) return false;
+
+        for (var r = 0; r < rows; r++) {
+          for (var c = 0; c < columns; c++) {
+            // The file is in ascending-axis order and storage is descending,
+            // so rows invert. Columns do not: both run ascending-X.
+            final source = (rows - 1 - r) * columns + c;
+            final index = field.isTable ? r * columns + c : r;
+            final saved = numbers[source]!;
+            final value = convert == null ? saved : convert(saved);
+            tune.writeRaw(
+              page,
+              field,
+              rawFromScaled(value, scale, translate),
+              index,
+            );
+          }
+        }
+        return true;
+    }
+  }
+}

@@ -1,0 +1,23 @@
+/// Speeduino serial protocol codec.
+///
+/// Pure Dart: this package knows how to speak to a Speeduino but nothing about
+/// serial ports, USB or Flutter. It operates over the [EcuLink] byte pipe, so
+/// the entire protocol layer can be exercised in CI against [FakeEcuLink] with
+/// no hardware attached.
+library;
+
+export 'src/command_runner.dart';
+export 'src/command_set.dart';
+export 'src/crc32.dart';
+export 'src/ecu_client.dart';
+export 'src/ecu_link.dart';
+export 'src/frame.dart';
+export 'src/realtime_decoder.dart';
+export 'src/realtime_monitor.dart';
+export 'src/realtime_plan.dart';
+export 'src/realtime_source.dart';
+export 'src/response_code.dart';
+export 'src/sensor_tables.dart';
+export 'src/speeduino_constants.dart';
+export 'src/trigger_log.dart';
+export 'src/trigger_logger.dart';

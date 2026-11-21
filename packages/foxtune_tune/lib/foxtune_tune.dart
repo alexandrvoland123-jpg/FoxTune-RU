@@ -1,0 +1,30 @@
+/// Tune state, table and curve math, tune files and datalogging.
+///
+/// Tune state is held as raw page byte buffers with typed views projected over
+/// them via the `.ini` model. Keeping bytes as the source of truth makes round
+/// trips to the ECU and to `.msq` lossless by construction.
+///
+/// Writing is guarded: see [WritePermission] for the conditions a session must
+/// satisfy, and [TuneWriter] for the write-verify-burn sequence.
+///
+/// Pure Dart.
+library;
+
+export 'src/autotune/autotune_settings.dart';
+export 'src/autotune/log_replay.dart';
+export 'src/autotune/mixture_units.dart';
+export 'src/autotune/ve_autotuner.dart';
+export 'src/curve_view.dart';
+export 'src/label_expressions.dart';
+export 'src/log_recorder.dart';
+export 'src/msl_reader.dart';
+export 'src/msl_writer.dart';
+export 'src/msq_codec.dart';
+export 'src/sensor_calibration.dart';
+export 'src/setting_view.dart';
+export 'src/table_file.dart';
+export 'src/table_view.dart';
+export 'src/tune_state.dart';
+export 'src/tune_writer.dart';
+export 'src/value_resolver.dart';
+export 'src/write_guard.dart';

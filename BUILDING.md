@@ -1,0 +1,636 @@
+# Building FoxTune
+
+## Prerequisites
+
+The Flutter SDK, which bundles Dart. FoxTune is developed against **Flutter 3.47 / Dart 3.13**.
+
+```sh
+# Linux, no package manager needed
+curl -LO https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.47.5-stable.tar.xz
+tar -xf flutter_linux_3.47.5-stable.tar.xz -C ~
+export PATH="$HOME/flutter/bin:$PATH"   # add this to your shell profile
+flutter doctor          # must show the Linux toolchain as ✓ before building
+```
+
+Per-platform build dependencies:
+
+| Target  | Needs                                                                                  |
+| ------- | -------------------------------------------------------------------------------------- |
+| Linux   | `ninja`, `cmake`, **`clang` and `clang++` on `PATH`**, `pkg-config`, GTK 3 dev headers |
+| Android | Android SDK + JDK 17 (`flutter doctor --android-licenses`)                             |
+| Windows | Visual Studio with the Desktop C++ workload                                            |
+| macOS   | Xcode; CocoaPods, automake and libtool from Homebrew, for `flutter_libserialport`      |
+
+On Gentoo that set is `dev-build/ninja dev-build/cmake llvm-core/clang dev-util/pkgconf
+x11-libs/gtk+:3` - note GTK **3**, since `gui-libs/gtk` is GTK 4 and Flutter's Linux embedder
+still uses GTK 3. On Debian/Ubuntu: `ninja-build cmake clang pkg-config libgtk-3-dev`.
+
+### Clang has to be on PATH, and on Gentoo it is not by default
+
+Flutter's Linux build hardcodes `CC=clang` and `CXX=clang++`. Gentoo slots LLVM under
+`/usr/lib/llvm/<slot>/bin` and does **not** create `/usr/bin/clang`, so installing
+`llvm-core/clang` is not enough on its own - the slot's bin directory has to be on `PATH`:
+
+```sh
+export PATH="/usr/lib/llvm/21/bin:$PATH"    # check `ls -d /usr/lib/llvm/*/bin` for your slot
+```
+
+Without it the build fails with a message Flutter swallows into `Error: Build process failed`;
+`flutter build linux` shows the real cause:
+
+```
+CMake Error ... Could not find the compiler specified in the environment variable CXX: clang++.
+CMake Error: CMAKE_CXX_COMPILER not set, after EnableLanguage
+```
+
+`flutter doctor` diagnoses this correctly, so check it first when a Linux build fails:
+
+```
+[✗] Linux toolchain - develop for Linux desktop
+    ✗ clang++ is required for Linux development.
+```
+
+What makes it confusing is that an unrelated toolchain can mask the problem. A Swift install
+via swiftly, for example, puts its own `clang` on `PATH` - so the same checkout builds in a
+shell where swiftly is initialised and fails in one where it is not, and `flutter doctor`
+passes in the first. If a build works in one terminal and not another, compare
+`command -v clang++` between them.
+
+### File dialogs need the desktop portal
+
+On Linux, opening and saving files goes through the XDG desktop portal (its `FileChooser`
+interface, over D-Bus). The file picker has no fallback to zenity or kdialog, so without a portal
+running there is no file dialog at all: saving a tune, importing a table or choosing a definition
+fails with an error naming `org.freedesktop.portal.Desktop`.
+
+Full desktops such as Plasma and GNOME run a portal already. A bare window manager may not:
+install `xdg-desktop-portal` together with the backend for your desktop - `xdg-desktop-portal-kde`
+on Plasma, `xdg-desktop-portal-gnome` on GNOME, `xdg-desktop-portal-gtk` anywhere else.
+
+## Where to run things
+
+This matters more than it should, and is the most common source of confusion:
+
+**Dart commands run from the repository root. Flutter commands run from the package directory.**
+
+The root is a Dart _workspace_ holding the three pure-Dart packages. It is not a Flutter app,
+so `flutter build linux` from the root fails with `Target file "lib/main.dart" not found` -
+that is the working directory being wrong, not a broken build.
+
+```sh
+# Core packages - from the repository root
+dart pub get
+./tool/test.sh                 # tests for every pure-Dart workspace member
+dart analyze
+dart format .
+
+# The app - from its own directory
+cd app/foxtune_app
+flutter pub get
+flutter test
+flutter analyze
+flutter run -d linux
+flutter build linux            # output: build/linux/x64/release/bundle/
+
+# The transport package - likewise
+cd packages/foxtune_transport
+flutter pub get && flutter test
+```
+
+`tool/test.sh` deliberately covers only the workspace members. `foxtune_transport` and the app
+depend on the Flutter SDK, so `dart test` cannot load their tests; run those with `flutter test`
+from their own directories.
+
+## The desktop window frame
+
+On a desktop, App settings → Title bar picks how the window's title bar is drawn: Windows,
+macOS or GNOME style, drawn by the app, or Native, drawn by the desktop. Unless one is chosen,
+Linux and Windows get the Windows style and macOS its native frame. For a drawn style, the top
+app bar of each screen doubles as the title bar (`WindowAppBar`, in `lib/src/window/`), and
+`window_manager` hides the native one. New full-window screens should use `WindowAppBar` rather
+than `AppBar`, or they will have no way to move or close the window. F11 (Ctrl+Cmd+F on a Mac)
+toggles full screen, Esc leaves it, and right-clicking the bar (or a long press on a touch
+screen) opens a window menu. Android keeps its native frame.
+
+On Windows and macOS every change applies at once. On a Mac, the macOS style keeps the window's
+own buttons and draws the app bar beneath them; the other drawn styles hide them.
+
+On Linux, whether the desktop draws the frame has to be settled before the window is made, so
+the runner (`linux/runner/my_application.cc`) reads `windowFrame` from the app's
+`settings.json` itself, from `FoxTune` under the XDG documents folder, where path_provider puts
+it. A change between Native and a drawn style then applies from the next start; a change between
+drawn styles applies at once.
+
+- **Drawn**: the runner creates a GTK header bar, only for it to be hidden. That is deliberate: a
+  window with a GTK titlebar stays client-side decorated, so GTK keeps drawing the shadow and
+  the resize edges, and tells KWin not to add a title bar of its own. Without one,
+  `window_manager` falls back to an undecorated window, which has neither.
+- **Native**: the runner creates no header bar, so the compositor decorates the window (KWin
+  draws its own; on GNOME, GTK draws a plain title bar). It passes `--native-frame` to `main`,
+  so the app neither hides a header bar that is not there nor draws a title bar of its own.
+
+### The icon on Wayland
+
+A Wayland session shows a generic icon for FoxTune in the task manager until its desktop entry is
+installed. Wayland compositors ignore the icon a window sets and instead look up the `.desktop`
+entry named after the application ID (`com.foxtune.foxtune_app`). X11 needs nothing: the runner
+sets the icon on the window itself. To install the entry and icons for your user, pointing at a
+build:
+
+```sh
+flutter build linux                 # from app/foxtune_app
+../../tool/install-linux-desktop.sh # or pass another bundle directory
+```
+
+The release tarball carries the same script: run `./install-linux-desktop.sh` from the `foxtune/`
+directory it unpacks to.
+
+Start FoxTune from that entry: the application menu, KRunner or a pinned task. KDE's System
+Monitor names an application after whatever launched it, so a FoxTune started by double-clicking
+the `foxtune` executable shows up there as the executable's path, and one started from a terminal
+shows up under the terminal.
+
+The AppImage needs its entry installed too, for example by AppImageLauncher. That renames the
+entry, so Plasma falls back to the entry's `StartupWMClass` to match FoxTune's window to it -
+which is why `StartupWMClass` has to stay equal to the application ID.
+
+The brand artwork, and where each platform's icons come from, is described in
+[branding/README.md](branding/README.md).
+
+## Developing without an ECU
+
+You do not need a Speeduino to work on almost any of this. The protocol package ships a
+simulator that speaks the real wire protocol over TCP and drives a plausible running engine:
+
+```sh
+cd packages/foxtune_tune
+dart run bin/fake_ecu.dart --msq /path/to/your-tune.msq
+```
+
+Then start the app and choose **Network ECU** -> `127.0.0.1:2000`. Gauges move, the live table
+cursor travels across cells, and warning thresholds are actually reached.
+
+| Flag                 | Effect                                                               |
+| -------------------- | -------------------------------------------------------------------- |
+| `--msq PATH`         | Seed the pages from a real tune                                      |
+| `--port N`           | Listen on a different port                                           |
+| `--ini PATH`         | Use a different ECU definition                                       |
+| `--static`           | Serve a fixed block instead of a running engine                      |
+| `--ve-error PERCENT` | Without `--msq`, how far the seeded VE table starts out (default -8) |
+
+**Pass a real tune.** Without one the simulator serves empty pages, which is not merely
+unrealistic - it is wrong in a way that looks like an app bug. Several realtime channels scale
+by an _expression_ rather than a constant: `fuelLoad`, the VE table's load axis, scales by
+`{ fuelLoadFeedBack }`, which resolves through a computed channel to the `algorithm`
+configuration constant. With no tune there is no `algorithm`, so the channel cannot be written
+and keeps whatever filler was in the block - a nonsense load that pins the live table cursor to
+the top row regardless of what the engine is doing. The simulator prints a warning naming any
+channel it could not scale.
+
+A base tune from a different firmware build is fine: values are matched by name, so whatever
+applies is loaded and the rest is reported.
+
+The one layer this cannot exercise is the desktop serial driver itself: libserialport rejects
+pseudo-terminals, so a `socat` loopback is not a usable stand-in for a real port. That layer
+needs real hardware or a tty0tty-style kernel module.
+
+### A simulated rusEFI
+
+Give `fake_ecu` a rusEFI definition and it serves a rusEFI - rusEFI's commands, page addressing
+and live-data layout - on port 29001:
+
+```sh
+cd packages/foxtune_tune
+dart run bin/fake_ecu.dart --ini ../foxtune_ini/test/fixtures/rusefi_uaefi.ini
+```
+
+Connect with **Network ECU** -> `127.0.0.1:29001`. FoxTune will look for the definition on
+rusefi.com; for the vendored fixture it finds it, and for any other it asks you for the file.
+
+Its engine is the same tune-driven one a simulated Speeduino runs: without `--msq` it seeds a
+base tune - Metric, speed density, a CAN wideband - with the VE table `--ve-error` percent out,
+so autotuning has something to correct. Switch the tune's "Lambda display" and it runs in lambda
+instead. A tune loaded with `--msq` that shows Imperial units will not autotune; the simulator
+says so when it starts.
+
+### rusEFI's own simulator
+
+rusEFI builds its real firmware for a PC too, answering on TCP port 29001. It is not in rusEFI's
+releases, so it is built from source. This worked on Gentoo against rusEFI master of 2026-09-21:
+
+```sh
+git clone --depth 1 https://github.com/rusefi/rusefi.git
+cd rusefi
+git submodule update --init --depth 1 \
+    firmware/ChibiOS firmware/ChibiOS-Contrib firmware/libfirmware \
+    firmware/ext/uzlib firmware/ext/lua firmware/controllers/lua/luaaa \
+    firmware/ext/magic_enum firmware/controllers/can/wideband_firmware \
+    firmware/ext/openblt
+cd simulator
+make -j"$(nproc)"
+./build/rusefi_simulator        # no argument: runs until stopped
+```
+
+What the build needs beyond `make`:
+
+- **A GCC that builds 32-bit code.** The simulator compiles with `-m32`. Gentoo's default
+  amd64 profiles are multilib, so this works out of the box; elsewhere it is usually a
+  `gcc-multilib`/`g++-multilib` package. `echo 'int main(){}' | g++ -m32 -x c++ - -o /dev/null`
+  says whether you have it.
+- **A JDK.** The build runs Gradle to generate code from rusEFI's configuration.
+- **mtools** (`sys-fs/mtools`), plus `zip`, `7z`, `xxd` and `mkfs.fat`. The build packs the
+  definition into the image an ECU shows as a USB drive, even for the simulator, and fails with
+  `mcopy: command not found` without mtools. Building mtools from GNU's source into a private
+  prefix and putting its `bin` on `PATH` for the `make` is enough if you would rather not
+  install it.
+
+Then connect FoxTune with **Network ECU** -> `127.0.0.1:29001`. The simulator runs the
+f407-discovery configuration; if rusEFI has published the definition for that build, FoxTune
+downloads it, and otherwise asks for the file - the build writes it to
+`firmware/tunerstudio/generated/rusefi_f407-discovery.ini`.
+
+The simulator answers every request about 40 ms late, whoever sends it, so live data from it
+runs at about 7 samples a second. A board over USB does not have this limit.
+
+## Android
+
+The Android build uses the Gradle, Android Gradle plugin and Kotlin versions of the pinned
+Flutter's own project template - Gradle 9.3.1, AGP 9.1.0 and Kotlin 2.4.0 for Flutter 3.47.5 -
+since that is the combination Flutter tests. When Flutter is bumped, move them to what its
+template then uses: `templateDefaultGradleVersion`, `templateAndroidGradlePluginVersion` and
+`templateKotlinGradlePluginVersion` in the SDK's `packages/flutter_tools/lib/src/android/gradle_utils.dart`.
+Keep the flags the template sets in `android/gradle.properties` too; they let plugins written
+for AGP 8 build under AGP 9.
+
+Two plugins would not build on Gradle 9 as published: `flutter_libserialport` and `usb_serial`
+both call `jcenter()`, which Gradle 9 removed. The app uses patched copies of both, from
+`third_party/` - see [third_party/README.md](third_party/README.md) for what changed and how to
+update them. `flutter_libserialport` is only used on desktop, but that does not spare it: Flutter
+builds a plugin's Android module whenever the plugin declares Android support.
+
+### Permissions
+
+The release manifest (`android/app/src/main/AndroidManifest.xml`) declares:
+
+| Declaration                   | Why                                                                          |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `android.permission.INTERNET` | TCP transport - a WiFi bridge, or the simulator on another machine           |
+| `android.hardware.usb.host`   | Declares USB host (OTG) use; `required="false"` keeps TCP-only phones listed |
+| `USB_DEVICE_ATTACHED` filter  | Plugging in a known board offers to open FoxTune (see below)                 |
+
+`INTERNET` has to be declared explicitly. Flutter's template only puts it in the **debug** and
+**profile** manifests, so a release APK built without it fails every socket with
+`OS Error: Operation not permitted, errno = 1` - Android refuses `socket()` outright to a
+process that does not hold the permission. It works in debug and breaks in release, which makes
+it easy to miss.
+
+`usb.host` is a declaration only. Permission to talk to a particular device is separate: Android
+asks the first time FoxTune opens it, or grants it up front when FoxTune was launched from the
+plug-in prompt.
+
+**Plugging in.** `MainActivity` registers for `USB_DEVICE_ATTACHED`, filtered by
+`res/xml/device_filter.xml`, so plugging a Speeduino in asks "Open FoxTune when this is
+connected?". Ticking **always** makes Android remember the USB permission, so connecting stops
+prompting. The filter lists vendor IDs, in decimal, and must match `EcuPort.knownEcuVendorIds`
+in `foxtune_transport` - a test fails if the two drift apart.
+
+Local network access needs nothing extra today: at `targetSdk` 36 it is implicitly granted by
+`INTERNET`, and Google's guidance is _not_ to declare `ACCESS_LOCAL_NETWORK` yet. That changes
+at `targetSdk` 37 (Android 17), where local network access is blocked by default and
+`ACCESS_LOCAL_NETWORK` becomes a runtime permission that has to be requested. Revisit this when
+the target SDK moves.
+
+### Testing on a phone
+
+CI builds the APK, but nothing in CI can plug a cable in. Before trusting a build in a car,
+go through this with the phone and a Speeduino - the bench ECU is fine, engine off:
+
+1. **Plug in.** Android offers to open FoxTune. Tick **always**; unplug and replug - FoxTune
+   opens with no permission prompt, and the board is at the top of the list.
+2. **Deny once.** Clear FoxTune's defaults (Settings -> Apps -> FoxTune -> Open by default),
+   replug, connect, tap **Deny**. The message says permission was denied - not a raw
+   exception - and connecting again asks again.
+3. **Connect over OTG.** Gauges move. Leave it for longer than the screen timeout; the screen
+   stays on. Disconnect; the screen times out normally again.
+4. **Pull the cable** with an unburned edit made (change one table cell). Within about a second
+   the app says **Connection lost**, and offers to save the edit as a `.msq`.
+5. **Files.** Save a tune to Downloads, then load it back. Export a table and re-import it.
+   Export a dashboard page and import it back; it arrives as a second page.
+6. **Logs.** Record for ten seconds, stop, tap **Save log…** in the message, and open the `.msl`
+   off the phone. The folder button next to **Record** lists earlier logs.
+
+Anything that behaves differently goes in an issue with the phone model and Android version:
+USB host support varies more between manufacturers than anywhere else on Android.
+
+## macOS
+
+The app is not sandboxed (`macos/Runner/*.entitlements`). It opens serial ports, connects to ECUs
+and downloads definitions over the network, and reads and writes tune files wherever the user
+keeps them - all of which the sandbox refuses without an exception for each. The sandbox is a
+requirement of the Mac App Store, and FoxTune is distributed directly instead.
+
+## Release signing
+
+Release signing is driven entirely by the environment, so no keystore is ever committed:
+
+| Variable                    | Set by                                       |
+| --------------------------- | -------------------------------------------- |
+| `ANDROID_KEYSTORE_PATH`     | CI, after decoding `ANDROID_KEYSTORE_BASE64` |
+| `ANDROID_KEYSTORE_PASSWORD` | secret                                       |
+| `ANDROID_KEY_ALIAS`         | secret                                       |
+| `ANDROID_KEY_PASSWORD`      | secret                                       |
+
+When `ANDROID_KEYSTORE_PATH` is unset - every local build, and any fork without the secrets -
+the release build falls back to the debug key so `flutter build apk --release` still produces
+an installable APK. It is just not distributable.
+
+The signing block lives in `android/app/build.gradle.kts`, not the root `build.gradle.kts`.
+That is not cosmetic: the Android Gradle plugin is applied to the `:app` module, so `android { }`
+in the root project is an unresolved reference and fails the build script compile with
+`Unresolved reference: signingConfigs`.
+
+To sign locally, point the same variables at your own keystore:
+
+```sh
+export ANDROID_KEYSTORE_PATH=/path/to/foxtune.jks
+export ANDROID_KEYSTORE_PASSWORD=... ANDROID_KEY_ALIAS=... ANDROID_KEY_PASSWORD=...
+flutter build apk --release
+```
+
+## Releasing
+
+A release is a tag. Its version comes from `app/foxtune_app/pubspec.yaml`, where
+`version: 1.2.0+7` means version 1.2.0, build number 7:
+
+```sh
+# Set the version in app/foxtune_app/pubspec.yaml, add a <release> for it at the
+# top of app/foxtune_app/linux/com.foxtune.foxtune_app.metainfo.xml, and commit
+# both. Then, on the commit that holds them:
+./tool/check-release-version.sh v1.2.0   # the same check CI makes
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+The tag runs all of CI, tests included, and then drafts a GitHub release carrying the Linux
+tarball, AppImage, `.deb` and `.rpm`, the Windows zip and installer, the macOS disk image, the
+signed APK and a `SHA256SUMS` file. Nothing is public until you look the draft over and publish it from the
+releases page.
+
+Only the APK is signed. The desktop builds would need a code-signing certificate on Windows and a
+paid Apple Developer account on macOS, so both operating systems warn the first time:
+
+- **Windows** SmartScreen stops the installer, or `FoxTune.exe` from the zip: **More info** ->
+  **Run anyway**.
+- **macOS** refuses to open the app. Try once, then allow it under **System Settings** ->
+  **Privacy & Security** -> **Open Anyway**.
+
+Before anything is built, the tag is checked against the pubspec:
+
+- **The tag must match the version:** `v1.2.0` for `version: 1.2.0+7`.
+- **The build number must be higher than the last release's.** It is Android's version code, and
+  Android will not install a build over one with a higher code. Once a release is installed, a
+  lower number cannot follow it.
+
+A release also refuses to build without the signing keystore secrets: an APK signed with the
+debug key could never be updated by a properly signed one.
+
+To redo a failed release, delete the tag and any draft it left, then tag again. Delete a tag that
+never became a release in any case: one that matches its pubspec looks like a release to the next
+check.
+
+```sh
+git push --delete origin v1.2.0 && git tag -d v1.2.0
+```
+
+### The AUR package
+
+Publishing a release - not drafting it - also publishes `foxtune-bin` to the AUR, through
+`.github/workflows/aur.yml`. The package is `app/foxtune_app/linux/aur/PKGBUILD`: the release's
+Linux tarball, installed where the `.deb` and `.rpm` put it. The workflow sets its version and
+checksum, installs its dependencies on Arch to prove they exist, builds it, writes `.SRCINFO` and
+pushes both to the AUR. Pre-releases are skipped; AUR versions cannot carry a `-` suffix.
+
+It downloads the tarball from the public release, so the repository has to be public by then.
+If it was not, or anything else failed, **Run workflow** on the AUR workflow publishes a given
+tag again.
+
+Pushing needs an AUR account holding an SSH key, set up once:
+
+1. Create an account on [aur.archlinux.org](https://aur.archlinux.org/).
+2. Make a key for this alone, without a passphrase, since CI has to use it unattended - and
+   outside the repository, where nothing would stop the private key being committed:
+   `ssh-keygen -t ed25519 -N '' -C 'FoxTune AUR' -f ~/.ssh/foxtune_aur`
+3. Paste `~/.ssh/foxtune_aur.pub` into the account's **SSH Public Key** field.
+4. Add the private key - all of `~/.ssh/foxtune_aur`, its `BEGIN` and `END` lines included - as
+   the repository secret `AUR_SSH_PRIVATE_KEY`.
+
+The first push creates the package, with that account as its maintainer.
+
+## Live data at high rates
+
+rusEFI can report 200 times a second, against Speeduino's 30 or so. Three things keep that from
+dragging the app down, or the app from holding it back.
+
+**The connection runs on an isolate of its own** (`EcuWorker`, in
+`packages/foxtune_protocol/lib/src/worker/`). The link, the command queue and its timeouts, live
+data polling and datalog writing all run there, on their own event loop. A frame that takes long
+to build, or a heavy screen opening, delays nothing on it: the poll rate holds and no reading is
+missed. Live data is handed to the UI's isolate in batches, each one acknowledged before the next
+is sent, so a busy UI gets fewer, larger batches rather than a flood. Past 2 seconds of backlog
+the oldest are dropped for the UI; a datalog, written on the worker, never drops any.
+
+- **Desktop serial and TCP open on the worker**: libserialport is plain FFI, and sockets work on
+  any isolate.
+- **Android's USB serial is relayed**: Flutter delivers platform-channel messages to the root
+  isolate alone, so its bytes pass through the UI's isolate on their way to and from the worker.
+  Framing, polling and logging still happen on the worker, but a UI hitch can delay a poll on
+  this route. Reading the device by its file descriptor (usbfs through FFI) from the worker would
+  close that gap.
+- **Tests and other transports run in-process**: a transport that is neither
+  `IsolateTransport` nor `RelayedTransport`, such as a test's fake, runs on the caller's isolate
+  as before. So does any connection whose worker cannot be started.
+
+**Only the parts of the block in use are read.** rusEFI's live data is 2216 bytes, read in three
+requests, of which a dashboard shows a few hundred. A Speeduino over serial at 115200 baud spends a
+millisecond on every eleven bytes. So every snapshot notes which channels are read of it
+(`ChannelDemand`), and polling reads just those. It also reads every channel on every dashboard
+page, so a page switched to is complete at once, and whatever those channels are computed or
+scaled from. The parts are merged into as few requests as the whole block would take, or fewer
+(`DemandReadPlan`, in `packages/foxtune_protocol/lib/src/realtime_plan.dart`).
+
+A channel read that a poll left out reads as unavailable, never as a stale value or a zero, and
+is read from the next poll on. One unread for 3 seconds is dropped. The whole block is still read
+in these cases:
+
+- for the first half second;
+- while a log records, since a log keeps every channel;
+- while autotuning is armed, since its filters must not pass a sample on a channel left unread;
+- from an ECU whose live data command takes no offset and count.
+
+**The UI takes what it can draw.** Widgets watch `liveProvider`, which passes on the newest sample
+at most once a frame. History, autotuning and the trigger logger listen to `realtimeProvider`,
+which carries every sample. The graph history keeps at most 50 samples a second, decoded once
+into columns per channel. Calm readouts, the default, let numbers change about 10 times a second
+while needles and bars follow every reading.
+
+## Measuring performance
+
+Judge smoothness in a profile or release build, never in a plain `flutter run`: debug builds
+run Dart unoptimised, and a dashboard that is smooth in release can stutter there.
+
+### The dashboard
+
+A benchmark draws a dashboard from a synthetic feed, with the whole connected shell up, and
+records frame timings in profile mode on the desktop:
+
+```sh
+cd app/foxtune_app
+flutter drive --profile -d linux \
+  --driver=test_driver/perf_driver.dart \
+  --target=integration_test/dashboard_perf_test.dart
+```
+
+It opens a window for about 40 seconds and writes the summary to
+`build/integration_response_data.json`. That covers build (UI thread) and raster times, averages
+and percentiles, once with the dashboard showing and once with it hidden behind the Tables tab.
+It also reports how late a 2 ms timer fired, which is how long the UI's isolate was kept busy by
+frames and live data alike, and how much the graph history holds. Keep the 90th percentile well
+under the 16 ms a 60 Hz frame allows.
+
+| `--dart-define`              | Effect                                                                  |
+| ---------------------------- | ----------------------------------------------------------------------- |
+| (none)                       | A real saved Speeduino layout (4 graphs, 11 gauges, 14 lamps) at 30 Hz |
+| `FOXTUNE_FEED=speeduino200`  | The same layout at 200 Hz: a full dashboard at rusEFI's rate            |
+| `FOXTUNE_FEED=rusefi200`     | rusEFI's default layout from the repository's fixture, at 200 Hz       |
+| `FOXTUNE_STILL=true`         | Every animation and effect off, to see what they cost                   |
+
+A few rules keep it low, and the benchmark shows it when one is broken:
+
+- **A widget showing live data watches `liveProvider` with `watchWhileVisible`**, not
+  `realtimeProvider` and not with `ref.watch`. The first passes on one sample a frame, however fast
+  they come. The second keeps hidden tabs, which the shell keeps alive, from rebuilding.
+- **It watches only what it shows** (`liveProvider.select`), so a lamp that holds its state and
+  the page around it are not rebuilt per sample.
+- **What moves with every reading is split from what does not.** The table grid takes the live
+  position as a listenable: its marker follows each reading, and its cells are rebuilt only when
+  the engine moves to another cell. Words and forms read `calmLiveProvider`, at most 10 times a
+  second.
+
+### The protocol
+
+A second benchmark polls a simulated rusEFI at 200 Hz, both on the calling isolate and on a
+worker. It runs once with that isolate idle, once with it busy 10 ms of every 16 as drawing
+frames keeps the UI's, and once with a 150 ms stall every second:
+
+```sh
+FOXTUNE_BENCH=1 dart test packages/foxtune_protocol/test/throughput_test.dart
+```
+
+On the calling isolate, frames cut the rate to about 120 Hz and every stall leaves a 150 ms hole
+in the data. On a worker, reading holds 200 Hz with no gap longer than a few milliseconds; only
+the handing over to the busy isolate waits for it.
+
+It also polls each ECU as fast as it answers, first reading the whole block and then only a
+typical dashboard's channels. For rusEFI that is 264 bytes in one request instead of 2216 in
+three: about four times the polls a second. The Speeduino runs on a simulated 115200 baud line
+(`FakeTsEcu.linkBytesPerSecond`), as over USB, and goes from about 70 polls a second to about
+250.
+
+## Dependencies
+
+Every `pubspec.lock` is committed - the workspace root's, the app's and the transport package's -
+and CI resolves with `--enforce-lockfile`. It builds exactly the versions they pin, and fails if a
+pubspec asks for something they do not, so updating is always a change you commit:
+
+```sh
+dart pub upgrade                                       # from the root: the core packages
+(cd app/foxtune_app && flutter pub upgrade)
+(cd packages/foxtune_transport && flutter pub upgrade)
+```
+
+The app and the transport package resolve the core packages' dependencies too. After changing a
+core package's pubspec, run `flutter pub get` in both and commit their lockfiles along with the
+root's; CI points out one that was missed.
+
+Dependabot proposes updates weekly as pull requests (`.github/dependabot.yml`): minor and patch
+updates grouped, each major version on its own, since that can need code changes. It leaves the
+Android Gradle files alone, since their versions move with Flutter's (see the Android section),
+and it cannot see the vendored plugins in `third_party/`. It also keeps the workflow's actions
+current, which are pinned to commits rather than tags: a tag can be moved to other code, and the
+Android job runs with the release signing key.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main`, every pull request, every release tag,
+and on demand from **Run workflow** in the Actions tab:
+
+| Job             | What it proves                                                                                      |
+| --------------- | --------------------------------------------------------------------------------------------------- |
+| `version`       | Names the build; for a release tag, first checks the tag against the app's version                  |
+| `core`          | The pure-Dart packages analyze, format and test with a bare Dart SDK                                |
+| `flutter`       | The transport package and app analyze and are formatted, and their tests pass                       |
+| `build-linux`   | The desktop app links and starts on glibc 2.35+; publishes a `.tar.gz`, AppImage, `.deb` and `.rpm` |
+| `build-windows` | The Windows app links, and publishes a `.zip` and an installer, both with the MSVC runtime          |
+| `build-macos`   | Release tags and manual runs only: the macOS app builds, and publishes a `.dmg`                     |
+| `build-android` | The APK compiles, is signed, and publishes an artifact                                              |
+| `release`       | Release tags only: drafts a GitHub release from the artifacts, with `SHA256SUMS`                    |
+
+The `core` job is the fast signal and should stay that way: it needs no device, display or
+emulator. It runs on the Dart SDK that the pinned Flutter ships (`DART_VERSION` in the
+workflow), since the formatter's output changes between SDK releases; bump the two together.
+
+A second workflow, `.github/workflows/aur.yml`, publishes the AUR package when a release is
+published; see "The AUR package" under Releasing.
+
+`build-macos` stays off ordinary pushes because macOS runners count ten times over against a
+private repository's Actions minutes. Run the workflow by hand to check a macOS build before
+tagging; once the repository is public, its `if:` can go.
+
+The Linux build runs on a pinned Ubuntu release rather than `ubuntu-latest`, because the build
+machine's glibc sets the oldest distribution the bundle will start on. `tool/check-linux-glibc.sh`
+fails the job if anything in the bundle needs a glibc newer than 2.35, Ubuntu 22.04's. The same
+script explains a locally built AppImage that will not start elsewhere: built on a rolling
+distribution, libserialport alone needs that distribution's glibc.
+
+```sh
+./tool/check-linux-glibc.sh                 # checks the release bundle against 2.35
+```
+
+The `.deb` and `.rpm` come from one description, `linux/nfpm.yaml`, built with
+[nfpm](https://nfpm.goreleaser.com/) by `tool/package-linux-deb-rpm.sh`. Both install the bundle to
+`/usr/lib/foxtune` as it is, link `/usr/bin/foxtune` to it, and put the desktop entry, icons and
+AppStream metadata where desktops look for them. They depend on GTK 3 and glibc 2.35, and
+recommend the desktop portal the file dialogs need. CI installs each where it will be used - the
+`.deb` on Ubuntu 24.04 and 22.04, the `.rpm` on Fedora - with `tool/check-linux-package.sh`, which
+fails if any library the app links against does not resolve there.
+
+## Troubleshooting
+
+**`Target file "lib/main.dart" not found`** - you ran a Flutter command from the repository
+root. `cd app/foxtune_app` first.
+
+**`dart test` fails to load a `flutter_test` import** - you pointed it at `foxtune_transport`
+or the app. Use `flutter test` from that package's directory.
+
+**`Error: Build process failed` from `flutter run -d linux`** - `flutter run` hides the
+compiler output. Run `flutter build linux` instead to see the real error. The usual cause is
+`clang++` not being on `PATH`; see the clang note above.
+
+**`SerialPortError: Invalid argument, errno = 22`** - libserialport was handed something that
+is not a real serial device, typically a `socat` pseudo-terminal.
+
+**An error naming `org.freedesktop.portal.Desktop` when opening or saving a file** - no desktop
+portal is running. See "File dialogs need the desktop portal" above.
+
+**No serial ports listed on Linux** - your user is probably not in the `dialout` group:
+
+```sh
+sudo usermod -aG dialout "$USER"   # log out and back in
+```
+
+**`OS Error: Operation not permitted, errno = 1` when connecting to a network ECU** - the
+Android build is missing the `INTERNET` permission. See the Android permissions section; note
+that debug builds have it and release builds do not unless it is declared in the main manifest.
+
+**`Could not find method jcenter()`** - a plugin calls the repository method Gradle 9 removed.
+Vendor and patch it the way `third_party/` does for two others; see the Android section above.

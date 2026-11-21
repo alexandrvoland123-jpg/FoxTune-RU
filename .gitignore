@@ -1,0 +1,42 @@
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+# pubspec.lock is committed, not ignored: CI builds and releases exactly the
+# dependency versions it pins. See "Dependencies" in BUILDING.md.
+*.dill
+doc/api/
+
+# 3rd party
+**/.gradle
+
+# Flutter generated
+.flutter-plugins
+.flutter-plugins-dependencies
+**/generated_plugin_registrant.dart
+app/foxtune_app/android/.gradle/
+app/foxtune_app/android/local.properties
+app/foxtune_app/ios/Pods/
+app/foxtune_app/.flutter-plugins*
+# CMake working files the Android build writes into a plugin's own directory -
+# the vendored ones under third_party/ included.
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# FoxTune local artifacts
+*.msl
+*.msq.bak
+/tmp-ini/
+
+# Secrets - a signing key committed anywhere is a leak, not just this one name
+*.jks
+*.keystore
+key.properties

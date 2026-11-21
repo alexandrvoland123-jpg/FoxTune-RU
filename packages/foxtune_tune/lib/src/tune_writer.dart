@@ -1,0 +1,217 @@
+import 'dart:typed_data';
+
+import 'package:foxtune_protocol/foxtune_protocol.dart';
+
+import 'tune_state.dart';
+import 'write_guard.dart';
+
+/// What happened when a page was committed.
+class CommitResult {
+  const CommitResult({
+    required this.page,
+    required this.bytesWritten,
+    required this.verified,
+    required this.burned,
+  });
+
+  final int page;
+  final int bytesWritten;
+
+  /// Whether the ECU's own CRC matched what we intended to store.
+  final bool verified;
+
+  /// Whether the page was committed to permanent storage.
+  ///
+  /// `false` for a page the definition gives no burn command - working memory
+  /// that took effect when it was written.
+  final bool burned;
+
+  @override
+  String toString() => 'CommitResult(page $page, $bytesWritten bytes, '
+      'verified: $verified, burned: $burned)';
+}
+
+/// Commits tune changes to an ECU, with the guard rails applied in order.
+///
+/// The sequence for every page is deliberate:
+///
+/// 1. Refuse unless [permission] allows it.
+/// 2. Snapshot the tune to disk before the first write of a session, so there
+///    is always something to go back to.
+/// 3. Write to RAM.
+/// 4. Ask the ECU for the page's CRC and compare. A write that did not land
+///    intact must never be burned.
+/// 5. Only then burn to permanent storage - where the page has a burn
+///    command at all. The commands are the definition's, through the client.
+///
+/// Verification before burning is the step that matters most: RAM can be
+/// re-written, but a corrupt page committed to EEPROM is what strands someone
+/// at the roadside.
+class TuneWriter {
+  TuneWriter({
+    required this.client,
+    required this.tune,
+    required this.permission,
+    this.blockingFactor,
+    this.onSnapshot,
+  });
+
+  final EcuClient client;
+  final TuneState tune;
+
+  /// Whether writes are allowed, and why not if they are refused.
+  final WritePermission permission;
+
+  /// Maximum payload per transfer. The client's commands carry the
+  /// definition's when this is left out.
+  final int? blockingFactor;
+
+  /// Invoked once, before the first write of the session, with a copy of the
+  /// tune as it was. Intended to persist a restore point.
+  final Future<void> Function(TuneState snapshot)? onSnapshot;
+
+  bool _snapshotTaken = false;
+
+  /// Whether the session's restore point has been taken.
+  bool get snapshotTaken => _snapshotTaken;
+
+  /// Writes, verifies and burns a single page.
+  ///
+  /// Throws [WriteRefusedException] if the guard rails forbid it, and
+  /// [EcuProtocolException] if verification fails - in which case nothing is
+  /// burned.
+  Future<CommitResult> commitPage(int page) async {
+    final reason = permission.reason;
+    if (!permission.allowed) {
+      throw WriteRefusedException(reason ?? 'Запись не разрешена.');
+    }
+
+    await _ensureSnapshot();
+
+    final bytes = tune.page(page);
+    await client.writePage(
+      page,
+      data: bytes,
+      blockingFactor: blockingFactor,
+    );
+
+    final expected = crc32(bytes);
+    final reported = await client.pageCrc(page);
+    if (reported != expected) {
+      // Deliberately not burned: a page that did not arrive intact must not be
+      // made permanent.
+      throw EcuProtocolException(
+          'Страница $page не прошла проверку после записи: ЭБУ сообщает CRC 0x${reported.toRadixString(16)}, ожидалось 0x${expected.toRadixString(16)}. Ничего не прошито.'
+          ''
+          '');
+    }
+
+    final burned = await client.burnPage(page);
+    // Clean either way: a page with no burn command is as committed as it
+    // gets once it has been written and verified.
+    tune.markClean(page);
+
+    return CommitResult(
+      page: page,
+      bytesWritten: bytes.length,
+      verified: true,
+      burned: burned,
+    );
+  }
+
+  /// Writes [length] bytes of [page] from [offset] to the ECU's RAM, and
+  /// reads them back.
+  ///
+  /// For a change meant to take effect while the engine runs - autotuning's
+  /// corrections, as they are made - without sending the rest of the page's
+  /// edits or burning anything. The page stays dirty: whether to burn it is
+  /// still the tuner's call, and until then it is lost when the ECU is
+  /// switched off. Checked by reading back rather than by the page's CRC,
+  /// which the page's other unsent edits would throw off.
+  ///
+  /// Throws [WriteRefusedException] if the guard rails forbid it, and
+  /// [EcuProtocolException] if what reads back is not what was sent.
+  Future<void> sendRange(
+    int page, {
+    required int offset,
+    required int length,
+  }) async {
+    final reason = permission.reason;
+    if (!permission.allowed) {
+      throw WriteRefusedException(reason ?? 'Запись не разрешена.');
+    }
+
+    await _ensureSnapshot();
+
+    final bytes = Uint8List.fromList(
+      tune.page(page).sublist(offset, offset + length),
+    );
+    await client.writePage(
+      page,
+      data: bytes,
+      offset: offset,
+      blockingFactor: blockingFactor,
+    );
+
+    final back = await client.readPage(
+      page,
+      count: length,
+      offset: offset,
+      blockingFactor: blockingFactor,
+    );
+    for (var i = 0; i < length; i++) {
+      if (back[i] != bytes[i]) {
+        throw EcuProtocolException(
+            'Страница $page: отправленные $length байт по смещению $offset прочитались иначе.'
+            '');
+      }
+    }
+  }
+
+  /// Commits every page with unsaved changes, lowest page first.
+  ///
+  /// Stops at the first failure rather than pressing on, so a verification
+  /// problem does not get repeated across the rest of the tune.
+  Future<List<CommitResult>> commitDirtyPages() async {
+    final pages = tune.dirtyPages.toList()..sort();
+    final results = <CommitResult>[];
+    for (final page in pages) {
+      results.add(await commitPage(page));
+    }
+    return results;
+  }
+
+  Future<void> _ensureSnapshot() async {
+    if (_snapshotTaken) return;
+    final callback = onSnapshot;
+    // Mark first: a snapshot that throws must not cause a retry loop that
+    // writes the tune to disk on every attempt.
+    _snapshotTaken = true;
+    if (callback != null) {
+      await callback(tune.copy());
+    }
+  }
+
+  /// Reads every page from the ECU into [tune].
+  ///
+  /// Used to establish a known-good starting point before editing.
+  static Future<TuneState> readAll(
+    EcuClient client, {
+    required TuneState into,
+    int? blockingFactor,
+    void Function(int page, int of)? onProgress,
+  }) async {
+    final sizes = into.definition.constants.pageSizes;
+    for (var i = 0; i < sizes.length; i++) {
+      final page = i + 1;
+      final data = await client.readPage(
+        page,
+        count: sizes[i],
+        blockingFactor: blockingFactor,
+      );
+      into.setPage(page, Uint8List.fromList(data));
+      onProgress?.call(page, sizes.length);
+    }
+    return into;
+  }
+}

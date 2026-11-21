@@ -1,0 +1,20 @@
+name: foxtune_tune
+description: Tune state, table/curve math and .msq import/export. Pure Dart.
+version: 0.1.0
+publish_to: none
+
+resolution: workspace
+
+environment:
+  sdk: ^3.6.0
+
+dependencies:
+  foxtune_ini:
+    path: ../foxtune_ini
+  foxtune_protocol:
+    path: ../foxtune_protocol
+  xml: ^7.0.1
+
+dev_dependencies:
+  lints: ^6.1.0
+  test: ^1.25.0

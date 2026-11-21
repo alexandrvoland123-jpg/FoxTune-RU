@@ -1,0 +1,268 @@
+import 'dart:typed_data';
+
+import 'package:foxtune_ini/foxtune_ini.dart';
+
+import 'realtime_plan.dart';
+
+/// Decodes the realtime data block into named, scaled channel values.
+///
+/// The layout comes entirely from the definition's `[OutputChannels]`, never
+/// from fixed offsets, so a firmware update that moves a field is picked up by
+/// loading the matching `.ini` rather than by changing this code.
+class RealtimeDecoder {
+  RealtimeDecoder(this.definition, {this.constantResolver, this.demand})
+      : _compiled = {
+          for (final channel in definition.computed)
+            if (CompiledExpression.tryCompile(channel.expression)
+                case final compiled?)
+              channel.name: compiled,
+        };
+
+  /// The channel definitions this decoder was built from.
+  final IniOutputChannels definition;
+
+  /// Supplies values for identifiers that are not realtime channels.
+  ///
+  /// Several computed channels depend on *tune constants* rather than
+  /// telemetry: `dutyCycle` needs `nSquirts` and `twoStroke`, which live on a
+  /// configuration page. Without this the expression cannot resolve and the
+  /// gauge reads as unavailable, so a dashboard with a loaded tune should pass
+  /// a resolver backed by it.
+  final double? Function(String name)? constantResolver;
+
+  /// Where the snapshots made here note what is read of them, so polling can
+  /// read only that. See [DemandReadPlan].
+  final ChannelDemand? demand;
+
+  /// Computed channels that parsed successfully, by name.
+  final Map<String, CompiledExpression> _compiled;
+
+  /// Scale and translate expressions, compiled once and keyed by source.
+  ///
+  /// Several channels scale by an expression rather than a literal - the VE
+  /// table's load axis, `fuelLoad`, scales by `{ fuelLoadFeedBack }`, which in
+  /// turn depends on a tune constant. Compiling these per sample would be
+  /// wasteful at 30 Hz, so they are cached on the decoder.
+  final Map<String, CompiledExpression?> _scaleExpressions = {};
+
+  /// Computed channels whose expression could not be parsed.
+  ///
+  /// These are reported rather than silently omitted, so a definition this
+  /// version cannot fully handle is visible instead of quietly incomplete.
+  late final Set<String> unsupportedChannels = {
+    for (final channel in definition.computed)
+      if (!_compiled.containsKey(channel.name)) channel.name,
+  };
+
+  /// Expected block size in bytes, as declared by `ochBlockSize`.
+  int? get blockSize => definition.blockSize;
+
+  /// Decodes [block] into a snapshot.
+  ///
+  /// A block shorter than the definition expects is accepted: fields that fall
+  /// outside it read as unavailable. Partial data is common while a connection
+  /// is settling, and is better surfaced per-channel than as a hard failure.
+  ///
+  /// Where only parts of the block were read, [coverage] says which: a field
+  /// outside them reads as unavailable too, never as the zeroes standing in
+  /// for it.
+  RealtimeSnapshot decode(
+    Uint8List block, {
+    DateTime? timestamp,
+    List<BlockSpan>? coverage,
+  }) =>
+      RealtimeSnapshot._(
+        block: block,
+        definition: definition,
+        compiled: _compiled,
+        scaleExpressions: _scaleExpressions,
+        constantResolver: constantResolver,
+        demand: demand,
+        coverage: coverage,
+        timestamp: timestamp ?? DateTime.now(),
+      );
+}
+
+/// One decoded sample of the realtime data block.
+///
+/// Values are computed on demand and memoised, so reading a handful of gauges
+/// from a 170-channel definition costs only what is asked for.
+class RealtimeSnapshot {
+  RealtimeSnapshot._({
+    required this.block,
+    required IniOutputChannels definition,
+    required Map<String, CompiledExpression> compiled,
+    required Map<String, CompiledExpression?> scaleExpressions,
+    required this.timestamp,
+    double? Function(String name)? constantResolver,
+    ChannelDemand? demand,
+    this.coverage,
+  })  : _definition = definition,
+        _compiled = compiled,
+        _scaleExpressions = scaleExpressions,
+        _constantResolver = constantResolver,
+        _demand = demand;
+
+  /// The raw bytes this snapshot was decoded from.
+  ///
+  /// The whole block, at its own offsets - but where [coverage] says only
+  /// parts of it were read, the rest is zeroes standing in for what was not.
+  final Uint8List block;
+
+  /// The parts of [block] that were read, or `null` where all of it was.
+  final List<BlockSpan>? coverage;
+
+  /// When the sample was taken.
+  final DateTime timestamp;
+
+  final IniOutputChannels _definition;
+  final Map<String, CompiledExpression> _compiled;
+  final Map<String, CompiledExpression?> _scaleExpressions;
+  final double? Function(String name)? _constantResolver;
+  final ChannelDemand? _demand;
+
+  // Made on first use rather than with the snapshot: a graph's history holds
+  // thousands of samples, most of which are never asked for anything.
+  Map<String, double?>? _cache;
+  Set<String>? _resolving;
+
+  /// The block, for reading fields - made once, not once a field.
+  late final ByteData _view = ByteData.sublistView(block);
+
+  /// Every channel name available, byte-backed and computed.
+  Set<String> get names => _definition.allNames;
+
+  /// The value of [name] in engineering units, or `null` if unavailable.
+  ///
+  /// Unavailable covers: an unknown name, an offset past the end of the block,
+  /// an unparsed expression, and any expression that depends on one of those.
+  /// Nothing is fabricated to fill a gap.
+  double? operator [](String name) => value(name);
+
+  /// See [operator []].
+  double? value(String name) {
+    final cache = _cache ??= {};
+    if (cache.containsKey(name)) return cache[name];
+
+    // Once a snapshot, and only on the way to working it out: what decides
+    // which parts of the block are polled.
+    _demand?.note(name);
+
+    // A definition could in principle define channels in terms of each other
+    // circularly; refuse rather than recurse forever.
+    final resolving = _resolving ??= {};
+    if (!resolving.add(name)) return null;
+    try {
+      final result = _compute(name);
+      cache[name] = result;
+      return result;
+    } finally {
+      resolving.remove(name);
+    }
+  }
+
+  double? _compute(String name) {
+    final field = _definition.channelNamed(name);
+    if (field != null) return _decodeField(field);
+
+    final expression = _compiled[name];
+    if (expression != null) return expression.evaluate(value);
+
+    // Not telemetry: fall back to the tune, where settings like nSquirts live.
+    return _constantResolver?.call(name);
+  }
+
+  double? _decodeField(IniField field) {
+    final offset = field.offset;
+    if (offset == null) return null;
+
+    switch (field) {
+      case IniBitsField(:final lowBit, :final highBit, :final type):
+        final word = _readRaw(offset, type, field.name)?.toInt();
+        if (word == null) return null;
+        final width = highBit - lowBit + 1;
+        final mask = (1 << width) - 1;
+        return ((word >> lowBit) & mask).toDouble();
+
+      case IniScalarField(:final type, :final scale, :final translate):
+        final raw = _readRaw(offset, type, field.name);
+        if (raw == null) return null;
+        final s = resolveScalar(scale);
+        final t = resolveScalar(translate);
+        if (s == null || t == null) return null;
+        return scaledFromRaw(raw, s, t);
+
+      case IniArrayField():
+        // Arrays do not appear in [OutputChannels] in practice; a single
+        // value has no meaning without an index.
+        return null;
+    }
+  }
+
+  /// The unscaled value of [name] straight from the block.
+  num? rawValue(String name) {
+    final field = _definition.channelNamed(name);
+    final offset = field?.offset;
+    if (field == null || offset == null) return null;
+    return _readRaw(offset, field.type, name);
+  }
+
+  /// The option label for a bits channel, e.g. `"On"`.
+  String? label(String name) {
+    final field = _definition.channelNamed(name);
+    if (field is! IniBitsField) return null;
+    final raw = value(name);
+    return raw == null ? null : field.labelFor(raw.toInt());
+  }
+
+  /// Whether a bits channel is set. Useful for status flags.
+  bool? flag(String name) {
+    final value = this[name];
+    return value == null ? null : value != 0;
+  }
+
+  /// Resolves an [IniScalarValue] that may be a literal or an expression.
+  ///
+  /// Expressions are evaluated against this snapshot, so a scale that depends
+  /// on another channel or on a tune constant resolves the same way any other
+  /// value does - and yields `null` if its inputs are unavailable rather than
+  /// silently scaling by one.
+  double? resolveScalar(IniScalarValue scalar) {
+    switch (scalar) {
+      case IniLiteral(:final value):
+        return value;
+      case IniExpression(:final source):
+        final compiled = _scaleExpressions.putIfAbsent(
+            source, () => CompiledExpression.tryCompile(source));
+        return compiled?.evaluate(value);
+    }
+  }
+
+  /// A whole number for the integer types; the float itself, unrounded, for
+  /// `F32` - rusEFI sends lambda, AFR and most of its channels as floats.
+  ///
+  /// `null` for bytes the poll did not read: the field [name] is noted as
+  /// missed, so the next poll reads it.
+  num? _readRaw(int offset, IniDataType type, String name) {
+    if (offset < 0 || offset + type.bytes > block.length) return null;
+    if (coverage case final read?
+        when !read.any((span) => span.covers(offset, type.bytes))) {
+      _demand?.missed(name);
+      return null;
+    }
+    final view = _view;
+    // Payload data is little-endian, unlike the frame envelope.
+    return switch (type) {
+      IniDataType.u08 => view.getUint8(offset),
+      IniDataType.s08 => view.getInt8(offset),
+      IniDataType.u16 => view.getUint16(offset, Endian.little),
+      IniDataType.s16 => view.getInt16(offset, Endian.little),
+      IniDataType.u32 => view.getUint32(offset, Endian.little),
+      IniDataType.s32 => view.getInt32(offset, Endian.little),
+      IniDataType.f32 => view.getFloat32(offset, Endian.little),
+    };
+  }
+
+  @override
+  String toString() => 'RealtimeSnapshot(${block.length} bytes @ $timestamp)';
+}

@@ -1,0 +1,449 @@
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:foxtune_tune/foxtune_tune.dart';
+
+import '../app_settings/map_colours.dart';
+import '../motion/gliding_value.dart';
+import '../motion/motion.dart';
+
+/// Projects a point on the table onto the isometric view.
+///
+/// [row] 0 is the LOWEST Y and must render at the front, matching the 2D grid
+/// where the lowest load is the bottom row. Screen y grows downward, so the row
+/// axis is negated here; without that the surface reads mirrored against the
+/// table beneath it.
+@visibleForTesting
+Offset surfacePointFor({
+  required double row,
+  required double column,
+  required double heightFraction,
+  required int rows,
+  required int columns,
+  required double rotation,
+  required double tilt,
+  required double scale,
+  required Offset centre,
+}) {
+  final x = column - (columns - 1) / 2;
+  final y = (rows - 1) / 2 - row;
+  final rotatedX = x * math.cos(rotation) - y * math.sin(rotation);
+  final rotatedY = x * math.sin(rotation) + y * math.cos(rotation);
+  return centre +
+      Offset(
+        rotatedX * scale,
+        rotatedY * scale * tilt - heightFraction * scale * 2.0,
+      );
+}
+
+/// Depth of a point for the painter's-algorithm sort.
+@visibleForTesting
+double surfaceDepthFor({
+  required double row,
+  required double column,
+  required int rows,
+  required int columns,
+  required double rotation,
+}) {
+  final x = column - (columns - 1) / 2;
+  final y = (rows - 1) / 2 - row;
+  return x * math.sin(rotation) + y * math.cos(rotation);
+}
+
+/// Whether the quad spanning ([quadRow], [quadColumn]) to (+1, +1) holds the
+/// given cell.
+///
+/// Exactly one quad matches any cell. An earlier version tested the cell
+/// against both ends of the quad's range inclusively, so an interior cell lit
+/// a 2x2 block of quads instead of the one it was in. Edge cells belong to the
+/// last quad, since there is none beyond them.
+@visibleForTesting
+bool surfaceQuadHoldsCell({
+  required int quadRow,
+  required int quadColumn,
+  required int cellRow,
+  required int cellColumn,
+  required int rows,
+  required int columns,
+}) =>
+    math.min(cellRow, rows - 2) == quadRow &&
+    math.min(cellColumn, columns - 2) == quadColumn;
+
+/// Depth to sort the exact-position marker at.
+///
+/// The marker lies *on* the surface, so sorting it by its own depth would put
+/// it behind the very quad it sits on whenever it falls in that quad's back
+/// half. Instead it takes the depth of its containing quad plus a hair, which
+/// draws it immediately after that quad - visible on its own cell, and still
+/// occluded by any quad genuinely nearer the viewer.
+@visibleForTesting
+double surfaceMarkerDepth({
+  required double row,
+  required double column,
+  required int rows,
+  required int columns,
+  required double rotation,
+}) {
+  // The containing quad, clamped at the far edges where no quad follows.
+  final quadRow = row.floor().clamp(0, math.max(0, rows - 2));
+  final quadColumn = column.floor().clamp(0, math.max(0, columns - 2));
+  return surfaceDepthFor(
+        row: quadRow + 0.5,
+        column: quadColumn + 0.5,
+        rows: rows,
+        columns: columns,
+        rotation: rotation,
+      ) +
+      1e-3;
+}
+
+/// Bilinearly interpolates the surface value at a fractional position, so a
+/// marker sits on the surface rather than snapping to the nearest corner.
+@visibleForTesting
+double? surfaceValueAt(List<List<double?>> grid, double row, double column) {
+  if (grid.isEmpty || grid.first.isEmpty) return null;
+  final rows = grid.length;
+  final columns = grid.first.length;
+
+  final r0 = row.floor().clamp(0, rows - 1);
+  final c0 = column.floor().clamp(0, columns - 1);
+  final r1 = math.min(r0 + 1, rows - 1);
+  final c1 = math.min(c0 + 1, columns - 1);
+
+  final v00 = grid[r0][c0];
+  final v01 = grid[r0][c1];
+  final v10 = grid[r1][c0];
+  final v11 = grid[r1][c1];
+  if (v00 == null || v01 == null || v10 == null || v11 == null) return null;
+
+  final fr = (row - r0).clamp(0.0, 1.0);
+  final fc = (column - c0).clamp(0.0, 1.0);
+  final lower = v00 + (v01 - v00) * fc;
+  final upper = v10 + (v11 - v10) * fc;
+  return lower + (upper - lower) * fr;
+}
+
+/// An isometric surface plot of a table.
+///
+/// Drawn with a plain [CustomPainter] and a painter's-algorithm depth sort
+/// rather than a GL dependency: the mesh is at most 16x16, so the cost is
+/// trivial and it keeps the build identical on every platform.
+class SurfaceView extends StatefulWidget {
+  const SurfaceView({
+    super.key,
+    required this.view,
+    this.cursor,
+    this.preciseCursor,
+    this.height = 320,
+  });
+
+  final TableView view;
+
+  /// The cell the engine is operating in, highlighted on the mesh.
+  final ({int row, int column})? cursor;
+
+  /// The engine's exact position, drawn as a marker on the surface.
+  final ({double row, double column})? preciseCursor;
+
+  final double height;
+
+  @override
+  State<SurfaceView> createState() => _SurfaceViewState();
+}
+
+class _SurfaceViewState extends State<SurfaceView> {
+  double _rotation = -0.6;
+  double _tilt = 0.5;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    // Once a build, not once a frame of the marker's glide.
+    final grid = widget.view.toGrid();
+    final glow = Motion.of(context).glow;
+    final precise = widget.preciseCursor;
+
+    Widget paintedAt(({double row, double column})? marker) => CustomPaint(
+      painter: _SurfacePainter(
+        grid: grid,
+        rotation: _rotation,
+        tilt: _tilt,
+        cursor: widget.cursor,
+        precise: marker,
+        colours: MapColours.of(context),
+        base: scheme.surfaceContainerHighest,
+        edgeColor: scheme.outlineVariant,
+        cursorColor: scheme.tertiary,
+        markerHalo: scheme.surface,
+        glow: glow,
+      ),
+      size: Size.infinite,
+    );
+
+    return SizedBox(
+      height: widget.height,
+      child: GestureDetector(
+        // Drag to orbit: the only way to read a surface is from several angles.
+        onPanUpdate: (details) => setState(() {
+          _rotation += details.delta.dx * 0.01;
+          _tilt = (_tilt + details.delta.dy * 0.005).clamp(0.05, 1.4);
+        }),
+        // The live marker glides between readings, as on the grid.
+        child: precise == null
+            ? paintedAt(null)
+            : GlidingValue<Offset>(
+                value: Offset(precise.column, precise.row),
+                builder: (context, at, _) =>
+                    paintedAt((row: at.dy, column: at.dx)),
+              ),
+      ),
+    );
+  }
+}
+
+class _SurfacePainter extends CustomPainter {
+  _SurfacePainter({
+    required this.grid,
+    required this.rotation,
+    required this.tilt,
+    required this.cursor,
+    required this.precise,
+    required this.colours,
+    required this.base,
+    required this.edgeColor,
+    required this.cursorColor,
+    required this.markerHalo,
+    this.glow = false,
+  });
+
+  final List<List<double?>> grid;
+  final double rotation;
+  final double tilt;
+  final ({int row, int column})? cursor;
+  final ({double row, double column})? precise;
+
+  /// The map gradient, and the colour it is laid over.
+  final MapColours colours;
+  final Color base;
+  final Color edgeColor;
+  final Color cursorColor;
+  final Color markerHalo;
+
+  /// Whether the live marker glows.
+  final bool glow;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (grid.isEmpty || grid.first.isEmpty) return;
+
+    final rows = grid.length;
+    final columns = grid.first.length;
+
+    var lo = double.infinity;
+    var hi = double.negativeInfinity;
+    for (final row in grid) {
+      for (final value in row) {
+        if (value == null) continue;
+        if (value < lo) lo = value;
+        if (value > hi) hi = value;
+      }
+    }
+    if (!lo.isFinite || !hi.isFinite) return;
+    final span = hi - lo == 0 ? 1.0 : hi - lo;
+
+    final scale = math.min(size.width / (columns + rows), size.height / 3.2);
+    final centre = Offset(size.width / 2, size.height * 0.62);
+
+    Offset project(double row, double column, double value) => surfacePointFor(
+      row: row,
+      column: column,
+      heightFraction: (value - lo) / span,
+      rows: rows,
+      columns: columns,
+      rotation: rotation,
+      tilt: tilt,
+      scale: scale,
+      centre: centre,
+    );
+
+    double depthOf(double row, double column) => surfaceDepthFor(
+      row: row,
+      column: column,
+      rows: rows,
+      columns: columns,
+      rotation: rotation,
+    );
+
+    // Painter's algorithm: draw far things first so near ones overlap them.
+    // The marker joins this list rather than being painted afterwards, so a
+    // peak in front of the operating point actually hides it.
+    final drawables = <({double depth, void Function(Canvas) paint})>[];
+
+    final edge = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = edgeColor;
+    for (var r = 0; r < rows - 1; r++) {
+      for (var c = 0; c < columns - 1; c++) {
+        final corners = [(r, c), (r, c + 1), (r + 1, c + 1), (r + 1, c)];
+        final values = [for (final (cr, cc) in corners) grid[cr][cc]];
+        if (values.any((v) => v == null)) continue;
+
+        final points = [
+          for (var i = 0; i < corners.length; i++)
+            project(
+              corners[i].$1.toDouble(),
+              corners[i].$2.toDouble(),
+              values[i]!,
+            ),
+        ];
+        final mean = values.reduce((a, b) => a! + b!)! / values.length;
+
+        final path = Path()..addPolygon(points, true);
+        final heightFraction = (mean - lo) / span;
+        // A quad's four corners are exactly the cells the ECU interpolates
+        // between, so highlighting the quad holding the precise position marks
+        // the contributing cells - the same four the grid rings.
+        final marked = precise ?? _preciseFromCursor();
+        final isCursor =
+            marked != null &&
+            surfaceQuadHoldsCell(
+              quadRow: r,
+              quadColumn: c,
+              cellRow: marked.row.floor(),
+              cellColumn: marked.column.floor(),
+              rows: rows,
+              columns: columns,
+            );
+
+        drawables.add((
+          depth: depthOf(r + 0.5, c + 0.5),
+          paint: (canvas) {
+            // Coloured as the grid is - see [MapColours].
+            canvas
+              ..drawPath(
+                path,
+                Paint()
+                  ..style = PaintingStyle.fill
+                  ..color = colours
+                      .on(base, heightFraction)
+                      .withValues(alpha: 0.92),
+              )
+              ..drawPath(path, edge);
+            if (isCursor) {
+              canvas.drawPath(
+                path,
+                Paint()
+                  ..style = PaintingStyle.stroke
+                  ..strokeWidth = 2.5
+                  ..color = cursorColor,
+              );
+            }
+          },
+        ));
+      }
+    }
+
+    _addMarker(drawables, rows, columns, lo, span, project);
+
+    drawables.sort((a, b) => a.depth.compareTo(b.depth));
+    for (final drawable in drawables) {
+      drawable.paint(canvas);
+    }
+  }
+
+  /// Queues the engine's exact position for drawing, depth-sorted with the
+  /// mesh so a peak in front of it hides it.
+  void _addMarker(
+    List<({double depth, void Function(Canvas) paint})> drawables,
+    int rows,
+    int columns,
+    double lo,
+    double span,
+    Offset Function(double, double, double) project,
+  ) {
+    final point = precise;
+    if (point == null) return;
+
+    final value = surfaceValueAt(grid, point.row, point.column);
+    if (value == null) return;
+
+    final top = project(point.row, point.column, value);
+    // A stem down to the table's floor: on a surface, a floating dot gives no
+    // sense of where it sits, so anchor it.
+    final base = project(point.row, point.column, lo);
+
+    drawables.add((
+      depth: surfaceMarkerDepth(
+        row: point.row,
+        column: point.column,
+        rows: rows,
+        columns: columns,
+        rotation: rotation,
+      ),
+      paint: (canvas) {
+        if (glow) {
+          canvas.drawCircle(
+            top,
+            9,
+            Paint()
+              ..color = cursorColor.withValues(alpha: 0.5)
+              ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 5),
+          );
+        }
+        canvas
+          ..drawLine(
+            base,
+            top,
+            Paint()
+              ..strokeWidth = 3
+              ..color = markerHalo.withValues(alpha: 0.85),
+          )
+          ..drawLine(
+            base,
+            top,
+            Paint()
+              ..strokeWidth = 1.4
+              ..color = cursorColor.withValues(alpha: 0.85),
+          )
+          ..drawCircle(
+            top,
+            6.5,
+            Paint()..color = markerHalo.withValues(alpha: 0.9),
+          )
+          ..drawCircle(top, 5, Paint()..color = cursorColor)
+          ..drawCircle(
+            top,
+            5,
+            Paint()
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 1.5
+              ..color = markerHalo,
+          );
+      },
+    ));
+  }
+
+  /// Falls back to the snapped cell when no exact position is available.
+  ({double row, double column})? _preciseFromCursor() {
+    final cell = cursor;
+    return cell == null
+        ? null
+        : (row: cell.row.toDouble(), column: cell.column.toDouble());
+  }
+
+  @override
+  bool shouldRepaint(_SurfacePainter old) =>
+      old.rotation != rotation ||
+      old.tilt != tilt ||
+      old.cursor != cursor ||
+      old.precise != precise ||
+      !identical(old.grid, grid) ||
+      // A new gradient, or the theme switching between light and dark.
+      old.colours.gradient != colours.gradient ||
+      old.base != base ||
+      old.edgeColor != edgeColor ||
+      old.cursorColor != cursorColor ||
+      old.markerHalo != markerHalo ||
+      old.glow != glow;
+}

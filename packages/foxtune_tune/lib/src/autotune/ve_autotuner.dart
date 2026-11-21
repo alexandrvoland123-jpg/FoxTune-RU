@@ -1,0 +1,717 @@
+import 'package:foxtune_ini/foxtune_ini.dart';
+
+import '../table_view.dart';
+import '../tune_state.dart';
+import '../value_resolver.dart';
+import '../write_guard.dart';
+import 'autotune_settings.dart';
+import 'mixture_units.dart';
+import 'readiness_checks.dart';
+
+/// Reads one channel of a sample, in engineering units.
+///
+/// Deliberately not a `RealtimeSnapshot`: the same analyser has to serve the
+/// live feed and a row of a recorded log.
+typedef AnalyzeSample = double? Function(String channel);
+
+/// Where samples come from, which decides when corrections are applied.
+enum AutotuneMode {
+  /// From the running engine. A cell moves a bounded step as soon as it has
+  /// enough evidence, and the samples taken once the ECU runs that step -
+  /// burned, or sent to its RAM - judge it.
+  live,
+
+  /// From a recorded log. Every row describes the table the log was recorded
+  /// with, so a step taken part-way through would be judged by rows that
+  /// never saw it - and taken again, and again. Evidence is gathered from the
+  /// whole log instead, and each cell corrected once by
+  /// [VeAutotuner.applyGathered].
+  replay,
+}
+
+/// What happened to one offered sample.
+class AutotuneOutcome {
+  const AutotuneOutcome._({
+    required this.accepted,
+    this.rejectedBy,
+    this.detail,
+    this.ratio,
+    this.moved = const [],
+  });
+
+  const AutotuneOutcome.rejected(IniAnalyzeFilter filter, {String? detail})
+      : this._(accepted: false, rejectedBy: filter, detail: detail);
+
+  const AutotuneOutcome.unusable(String detail)
+      : this._(accepted: false, detail: detail);
+
+  const AutotuneOutcome.accepted({
+    required double ratio,
+    List<({int row, int column})> moved = const [],
+  }) : this._(accepted: true, ratio: ratio, moved: moved);
+
+  /// Whether the sample contributed to the correction.
+  final bool accepted;
+
+  /// The filter that rejected it, where a filter did.
+  ///
+  /// Named rather than counted, because "why is it not collecting data" is the
+  /// question this feature gets asked most.
+  final IniAnalyzeFilter? rejectedBy;
+
+  /// Why it could not be used, when no filter is to blame - a channel the ECU
+  /// is not reporting, say.
+  final String? detail;
+
+  /// How far off target the sample was: 1.0 is on target, 1.05 is 5% lean.
+  final double? ratio;
+
+  /// Cells this sample moved, if it pushed any past their threshold.
+  final List<({int row, int column})> moved;
+
+  /// A short explanation fit to show a user.
+  String get description => accepted
+      ? 'Сбор данных'
+      : detail ?? 'Ожидание: ${rejectedBy?.displayLabel ?? 'неизвестно'}';
+}
+
+/// What autotuning has gathered for one cell.
+class AutotuneCell {
+  AutotuneCell({required this.baseline});
+
+  /// The cell's value when autotuning first touched it.
+  ///
+  /// Corrections are written as a percentage of this rather than nudged onto
+  /// the current value, so repeated rounding cannot walk a cell away.
+  final double baseline;
+
+  /// Accumulated sample weight since the last application.
+  double weight = 0;
+
+  /// Weight-multiplied sum of correction ratios since the last application.
+  double weightedRatio = 0;
+
+  /// Samples that have ever landed here, for coverage display.
+  int samples = 0;
+
+  /// Total correction applied so far, as a percentage of [baseline].
+  double appliedPercent = 0;
+
+  /// The mean correction ratio held right now, or `null` with no data.
+  double? get pendingRatio => weight == 0 ? null : weightedRatio / weight;
+}
+
+/// Whether a tune and definition can be autotuned at all.
+class AutotuneReadiness {
+  const AutotuneReadiness.ready() : reason = null;
+
+  const AutotuneReadiness.blocked(this.reason);
+
+  /// Why not, or `null` when it can run.
+  final String? reason;
+
+  /// Whether autotuning may be armed.
+  bool get ready => reason == null;
+}
+
+/// Autotunes a VE table against a target, from fuelling measurements.
+///
+/// The arithmetic is the easy half. The hard half - and nearly all of the code
+/// here - is deciding when a reading is telling the truth about the steady
+/// state of the fuel table rather than about something else the engine was
+/// doing. The definition's `[VeAnalyze]` filters supply most of those rules,
+/// so they track the firmware instead of being guessed at here.
+class VeAutotuner {
+  VeAutotuner._({
+    required this.config,
+    required this.table,
+    required this.target,
+    required this.resolver,
+    required this.settings,
+    required this.permission,
+    required this.units,
+    required this.mode,
+    required double stoich,
+  }) : _stoich = stoich;
+
+  /// Builds a tuner, or returns why one cannot be built.
+  ///
+  /// [tune] supplies the tables; [permission] is the same gate every other
+  /// edit passes through, so a read-only session cannot autotune either.
+  static ({VeAutotuner? tuner, AutotuneReadiness readiness}) create({
+    required TuneState tune,
+    required WritePermission permission,
+    TuneValueResolver? resolver,
+    AutotuneSettings settings = const AutotuneSettings(),
+    AutotuneMode mode = AutotuneMode.live,
+  }) {
+    final definition = tune.definition;
+    final config = definition.veAnalyze;
+    if (config == null) {
+      return (
+        tuner: null,
+        readiness: const AutotuneReadiness.blocked(
+          'Это определение не описывает автонастройку VE.',
+        ),
+      );
+    }
+
+    final shared = resolver ?? TuneValueResolver(tune);
+
+    final tableDefinition = definition.tableNamed(config.table);
+    final targetDefinition = definition.tableNamed(config.targetTable);
+    if (tableDefinition == null || targetDefinition == null) {
+      return (
+        tuner: null,
+        readiness: AutotuneReadiness.blocked(
+          'В определении названы таблицы «${config.table}» и «${config.targetTable}», которых оно не объявляет.'
+          '',
+        ),
+      );
+    }
+
+    final table = TableView.of(tune, tableDefinition, resolver: shared);
+    final target = TableView.of(tune, targetDefinition, resolver: shared);
+    if (table == null || target == null) {
+      return (
+        tuner: null,
+        readiness: const AutotuneReadiness.blocked(
+          'Таблицу VE или целевую таблицу не удалось определить из этого тюна.',
+        ),
+      );
+    }
+
+    final problem = autotuneSetupProblem(
+      tune: tune,
+      resolver: shared,
+      config: config,
+      table: table,
+      target: target,
+    );
+    if (problem != null) {
+      return (tuner: null, readiness: AutotuneReadiness.blocked(problem));
+    }
+
+    // Live, only the ECU can say whether a correction has reached the engine
+    // yet, by reporting the VE it looked up. A log says for itself, row by
+    // row, and a replay checks for the column.
+    if (mode == AutotuneMode.live &&
+        !runningVeChannels.any(definition.outputChannels.allNames.contains)) {
+      return (
+        tuner: null,
+        readiness: AutotuneReadiness.blocked(
+          'Эта прошивка не сообщает VE, с которой работает (${runningVeChannels.join(' or ')}), поэтому неизвестно, когда коррекция дошла до двигателя. Автонастройка остаётся выключенной, чтобы не исправлять одну ошибку дважды.'
+          ''
+          ''
+          '',
+        ),
+      );
+    }
+
+    if (!permission.allowed) {
+      return (
+        tuner: null,
+        readiness: AutotuneReadiness.blocked(
+          permission.reason ?? 'Запись не разрешена в этом сеансе.',
+        ),
+      );
+    }
+
+    return (
+      tuner: VeAutotuner._(
+        config: config,
+        table: table,
+        target: target,
+        resolver: shared,
+        settings: settings,
+        permission: permission,
+        units: mixtureUnitsOf(config, target),
+        mode: mode,
+        // rusEFI declares no `stoich`, and needs none: its AFR is always
+        // gasoline-scaled - lambda times 14.7 - whatever the fuel.
+        stoich: shared.resolve('stoich') ?? 14.7,
+      ),
+      readiness: const AutotuneReadiness.ready(),
+    );
+  }
+
+  /// The `[VeAnalyze]` description this follows.
+  final IniVeAnalyze config;
+
+  /// The VE table being tuned.
+  final TableView table;
+
+  /// The table supplying the target at each operating point.
+  final TableView target;
+
+  final TuneValueResolver resolver;
+
+  /// The limits this session runs under.
+  final AutotuneSettings settings;
+
+  /// The write gate this session passed.
+  final WritePermission permission;
+
+  /// Whether readings and targets are lambda or AFR, fixed when armed.
+  final MixtureUnits units;
+
+  /// Whether samples are live or replayed from a log.
+  final AutotuneMode mode;
+
+  final double _stoich;
+
+  final Map<({int row, int column}), AutotuneCell> _cells = {};
+  final Map<String, CompiledExpression?> _compiled = {};
+
+  ({int row, int column})? _lastCell;
+  DateTime? _cellEnteredAt;
+
+  int _accepted = 0;
+  int _rejected = 0;
+
+  /// Samples used so far.
+  int get acceptedSamples => _accepted;
+
+  /// Samples discarded by a filter so far.
+  int get rejectedSamples => _rejected;
+
+  /// Cells holding data or corrections, keyed by position.
+  Map<({int row, int column}), AutotuneCell> get cells =>
+      Map.unmodifiable(_cells);
+
+  /// Cells that have been moved.
+  int get movedCells =>
+      _cells.values.where((c) => c.appliedPercent != 0).length;
+
+  /// The settling rule, which the definition does not describe.
+  static const settlingFilter = IniAnalyzeFilter(
+    id: 'std_Settling',
+    label: 'Успокоение',
+  );
+
+  /// The plausible-mixture rule, applied whether or not the definition
+  /// declares it.
+  ///
+  /// rusEFI's does not. Without it, a wideband that has died and reads zero
+  /// would ask for every cell it passes to be taken out entirely - and each
+  /// would be, a step at a time, down to the session limit: leaner.
+  static const deadSensorFilter = IniAnalyzeFilter(
+    id: 'std_DeadLambda',
+    label: 'Показание смеси',
+  );
+
+  /// The rule that a sample was taken with the ECU running the table loaded
+  /// now.
+  ///
+  /// A sample's correction is relative to the VE the engine actually ran.
+  /// Live, the tune changes the moment a correction is made, but the ECU runs
+  /// it only once it is burned or sent: until then every sample in that cell
+  /// still shows the error just corrected, and would correct it again, and
+  /// again. A replayed log was recorded with one table throughout, and applied
+  /// to a table that has moved since - by replaying the same log before, say -
+  /// it would be applied on top of itself.
+  static const runningVeFilter = IniAnalyzeFilter(
+    id: 'std_RunningVe',
+    label: 'Таблица с тех пор изменилась',
+  );
+
+  /// Channels carrying the VE the ECU looked up, in the order tried.
+  ///
+  /// The definition does not say which channel this is, so it is keyed on the
+  /// name: Speeduino's `VE1` is the first VE table's own lookup, rusEFI's
+  /// `veValue` its VE table's.
+  static const runningVeChannels = ['VE1', 'veValue'];
+
+  /// How far a running VE may sit from the table's, in storage steps.
+  ///
+  /// More than one: Speeduino interpolates in integer arithmetic and reports
+  /// a whole number, so a sample taken on this very table can be a step out.
+  static const _runningVeSteps = 1.5;
+
+  /// Discards everything gathered, and re-reads each cell's starting value.
+  void reset() {
+    _cells.clear();
+    interrupt();
+    _accepted = 0;
+    _rejected = 0;
+  }
+
+  /// Restarts the settling wait, as though the engine had just arrived.
+  ///
+  /// For a break in the samples - a gap in a log, or its clock running
+  /// backwards where two recordings were joined - across which the operating
+  /// point cannot be assumed to have held still.
+  void interrupt() {
+    _lastCell = null;
+    _cellEnteredAt = null;
+  }
+
+  /// Corrects each cell once from everything gathered, and returns the cells
+  /// whose stored value changed.
+  ///
+  /// For [AutotuneMode.replay]. There is no loop to converge, so the step
+  /// limit - which exists to let the next measurement judge the last one -
+  /// does not apply; the session limit still bounds how far a cell moves.
+  /// A cell with less evidence than [AutotuneSettings.minWeight] is left
+  /// alone, as it would be live.
+  List<({int row, int column})> applyGathered() {
+    final moved = <({int row, int column})>[];
+    for (final entry in _cells.entries) {
+      if (entry.value.weight < settings.minWeight) continue;
+      if (_apply(entry.key, entry.value, maxStep: settings.maxTotalPercent)) {
+        moved.add(entry.key);
+      }
+    }
+    return moved;
+  }
+
+  /// Offers one sample, applying a correction if it earns one.
+  AutotuneOutcome offer(AnalyzeSample read, DateTime at) {
+    final xChannel = table.table.xBins.channel;
+    final yChannel = table.table.yBins.channel;
+    if (xChannel == null || yChannel == null) {
+      return const AutotuneOutcome.unusable(
+        'Для осей таблицы VE не заданы каналы реального времени.',
+      );
+    }
+
+    final x = read(xChannel);
+    final y = read(yChannel);
+    if (x == null || y == null) {
+      return AutotuneOutcome.unusable(
+        'Ожидание $xChannel и $yChannel от ЭБУ.',
+      );
+    }
+
+    final active = config.activeCondition;
+    if (active != null && !_holds(active, read)) {
+      _rejected++;
+      return const AutotuneOutcome.unusable(
+        'Определение сообщает, что анализ сейчас не применяется.',
+      );
+    }
+
+    // Settling comes first: until the operating point holds still there is no
+    // point asking anything else about the sample.
+    final settling = _settlingCheck(x, y, at);
+    if (settling != null) {
+      _rejected++;
+      return settling;
+    }
+
+    for (final filter in config.filters) {
+      final rejection = _evaluate(filter, read, x, y);
+      if (rejection != null) {
+        _rejected++;
+        return rejection;
+      }
+    }
+
+    final stale = _runningVeCheck(read, x, y);
+    if (stale != null) {
+      _rejected++;
+      return stale;
+    }
+
+    final measured = read(config.measuredChannel);
+    if (measured == null) {
+      return AutotuneOutcome.unusable(
+        'Ожидание ${config.measuredChannel} от ЭБУ.',
+      );
+    }
+
+    final dead = _evaluateStandard(deadSensorFilter, read, x, y);
+    if (dead != null) {
+      _rejected++;
+      return dead;
+    }
+    final measuredLambda = _toLambda(measured);
+
+    // The target is read where the target table says the engine is, which
+    // need not be where the VE table does: rusEFI gives each its own load
+    // channel, and either can be overridden to TPS. Falling back to the VE
+    // table's reading would look the target up at the wrong load.
+    final tx = _targetAxis(target.table.xBins.channel, xChannel, x, read);
+    final ty = _targetAxis(target.table.yBins.channel, yChannel, y, read);
+    if (tx == null || ty == null) {
+      return AutotuneOutcome.unusable(
+        'Ожидание ${target.table.xBins.channel} и ${target.table.yBins.channel} от ЭБУ.'
+        '',
+      );
+    }
+
+    final targetValue = target.interpolatedAt(tx, ty);
+    if (targetValue == null) {
+      return const AutotuneOutcome.unusable(
+        'В целевой таблице нет значения в этой рабочей точке.',
+      );
+    }
+    final targetLambda = _toLambda(targetValue);
+    // No engine is tuned for a mixture outside this. A target that reads as
+    // one has been misread - in the wrong units, most likely - and tuning
+    // against it would move every cell the wrong way.
+    if (!(targetLambda >= _targetLambdaMin &&
+        targetLambda <= _targetLambdaMax)) {
+      return AutotuneOutcome.unusable(
+        'Цель здесь читается как ${targetLambda.toStringAsFixed(2)} лямбда, что не может быть целью по смеси.'
+        '',
+      );
+    }
+
+    // A closed loop already trimming fuel means the table under it is wrong by
+    // that much, even though the measurement looks on target. Folding the trim
+    // in tunes the table rather than fighting the correction.
+    final trim = read(config.egoCorrectionChannel);
+    final egoFactor = trim == null || trim <= 0 ? 1.0 : trim / 100.0;
+
+    final ratio = (measuredLambda / targetLambda) * egoFactor;
+
+    _accepted++;
+    final moved = _distribute(x, y, ratio);
+    return AutotuneOutcome.accepted(ratio: ratio, moved: moved);
+  }
+
+  static const _targetLambdaMin = 0.4;
+  static const _targetLambdaMax = 2.5;
+
+  /// Converts a reading to lambda, using the tune's own stoichiometric ratio.
+  double _toLambda(double value) =>
+      units == MixtureUnits.lambda ? value : value / _stoich;
+
+  /// The target table's reading on one axis: the VE table's [shared] reading
+  /// where both follow the same channel, otherwise the target's own.
+  double? _targetAxis(
+    String? channel,
+    String veChannel,
+    double shared,
+    AnalyzeSample read,
+  ) =>
+      channel == null || channel == veChannel ? shared : read(channel);
+
+  /// Rejects a sample taken while the ECU ran something other than what the
+  /// table gives there now.
+  ///
+  /// A sample that does not say what the ECU ran is rejected too: nothing then
+  /// says which table it describes.
+  AutotuneOutcome? _runningVeCheck(AnalyzeSample read, double x, double y) {
+    double? running;
+    for (final channel in runningVeChannels) {
+      running = read(channel);
+      if (running != null) break;
+    }
+    final current = table.interpolatedAt(x, y);
+    if (running == null || current == null) {
+      return const AutotuneOutcome.rejected(runningVeFilter);
+    }
+    if ((running - current).abs() <= table.zStep * _runningVeSteps) {
+      return null;
+    }
+
+    final ran = running.toStringAsFixed(1);
+    final now = current.toStringAsFixed(1);
+    return AutotuneOutcome.rejected(
+      runningVeFilter,
+      detail: switch (mode) {
+        AutotuneMode.live =>
+          'ЭБУ всё ещё работает с $ran здесь; в таблице сейчас $now',
+        AutotuneMode.replay =>
+          'Записано при VE $ran здесь, где сейчас в таблице $now',
+      },
+    );
+  }
+
+  AutotuneOutcome? _settlingCheck(double x, double y, DateTime at) {
+    final cell = table.cellFor(x, y);
+    if (cell == null) return null;
+
+    if (_lastCell != cell) {
+      _lastCell = cell;
+      _cellEnteredAt = at;
+    }
+    final since = _cellEnteredAt;
+    if (since == null) {
+      _cellEnteredAt = at;
+      return const AutotuneOutcome.rejected(settlingFilter);
+    }
+
+    if (at.difference(since) < settings.settlingTime) {
+      return const AutotuneOutcome.rejected(settlingFilter);
+    }
+    return null;
+  }
+
+  /// Applies one filter, returning a rejection when it blocks the sample.
+  AutotuneOutcome? _evaluate(
+    IniAnalyzeFilter filter,
+    AnalyzeSample read,
+    double x,
+    double y,
+  ) {
+    if (filter.isStandard) return _evaluateStandard(filter, read, x, y);
+
+    final operator = filter.operator;
+    final threshold = filter.value;
+    if (operator == null || threshold == null) return null;
+
+    final value = read(filter.channel);
+    // A channel this ECU does not report cannot condemn a sample. Rejecting
+    // on it would stop autotuning entirely on firmware that omits it.
+    if (value == null) return null;
+
+    final blocks = switch (operator) {
+      IniFilterOperator.lessThan => value < threshold,
+      IniFilterOperator.greaterThan => value > threshold,
+      IniFilterOperator.equals => value == threshold,
+      IniFilterOperator.bitmask => (value.toInt() & threshold.toInt()) != 0,
+    };
+    return blocks ? AutotuneOutcome.rejected(filter) : null;
+  }
+
+  AutotuneOutcome? _evaluateStandard(
+    IniAnalyzeFilter filter,
+    AnalyzeSample read,
+    double x,
+    double y,
+  ) {
+    switch (filter.id) {
+      case 'std_xAxisMin':
+        final low = table.xAt(0);
+        return low != null && x < low
+            ? AutotuneOutcome.rejected(filter,
+                detail: 'Ниже таблицы при ${x.round()} ${table.xUnits}')
+            : null;
+
+      case 'std_xAxisMax':
+        final high = table.xAt(table.columns - 1);
+        return high != null && x > high
+            ? AutotuneOutcome.rejected(filter,
+                detail: 'За таблицей при ${x.round()} ${table.xUnits}')
+            : null;
+
+      case 'std_yAxisMin':
+        final low = table.yAt(0);
+        return low != null && y < low
+            ? AutotuneOutcome.rejected(filter,
+                detail: 'Ниже таблицы при ${y.round()} ${table.yUnits}')
+            : null;
+
+      case 'std_yAxisMax':
+        final high = table.yAt(table.rows - 1);
+        return high != null && y > high
+            ? AutotuneOutcome.rejected(filter,
+                detail: 'За таблицей при ${y.round()} ${table.yUnits}')
+            : null;
+
+      case 'std_DeadLambda':
+        final measured = read(config.measuredChannel);
+        if (measured == null) return AutotuneOutcome.rejected(filter);
+        final lambda = _toLambda(measured);
+        final dead = !lambda.isFinite ||
+            lambda < settings.lambdaMin ||
+            lambda > settings.lambdaMax;
+        return dead
+            ? AutotuneOutcome.rejected(filter,
+                detail: 'Показание смеси ${lambda.toStringAsFixed(2)} лямбда вне допустимого диапазона'
+                    '')
+            : null;
+
+      case 'std_Custom':
+        final source = settings.customFilter.trim();
+        if (source.isEmpty) return null;
+        return _holds(source, read)
+            ? AutotuneOutcome.rejected(filter, detail: 'Пользовательский фильтр: $source')
+            : null;
+
+      default:
+        // A standard filter this version does not implement must not silently
+        // pass as though it had been applied.
+        return AutotuneOutcome.rejected(filter,
+            detail: 'Фильтр «${filter.id}» пока не поддерживается');
+    }
+  }
+
+  /// Whether [source] evaluates true against the sample and the tune.
+  bool _holds(String source, AnalyzeSample read) {
+    final compiled = _compiled.putIfAbsent(
+      source,
+      () => CompiledExpression.tryCompile(source),
+    );
+    if (compiled == null) return false;
+    final value =
+        compiled.evaluate((name) => read(name) ?? resolver.resolve(name));
+    return value != null && value != 0;
+  }
+
+  /// Credits [ratio] to the cells around the operating point and applies any
+  /// that have gathered enough evidence.
+  List<({int row, int column})> _distribute(double x, double y, double ratio) {
+    final moved = <({int row, int column})>[];
+
+    for (final entry in table.weightsAt(x, y)) {
+      final key = (row: entry.row, column: entry.column);
+      final current = table.valueAt(key.row, key.column);
+      if (current == null) continue;
+
+      final cell =
+          _cells.putIfAbsent(key, () => AutotuneCell(baseline: current));
+      cell.weight += entry.weight;
+      cell.weightedRatio += entry.weight * ratio;
+      cell.samples++;
+
+      // A replay only gathers: see [AutotuneMode.replay].
+      if (mode == AutotuneMode.replay) continue;
+      if (cell.weight < settings.minWeight) continue;
+      if (_apply(key, cell, maxStep: settings.maxStepPercent)) moved.add(key);
+    }
+
+    return moved;
+  }
+
+  /// Moves one cell towards what its samples are asking for, by at most
+  /// [maxStep] percent.
+  ///
+  /// Returns whether the stored value actually changed, which is not the same
+  /// as whether a correction was book-kept: the running total accumulates
+  /// steps too small for the storage to hold, so a cell on a coarse table
+  /// still reaches its target over several passes rather than being rounded
+  /// away to nothing each time.
+  bool _apply(
+    ({int row, int column}) key,
+    AutotuneCell cell, {
+    required double maxStep,
+  }) {
+    final mean = cell.pendingRatio;
+    final wanted = mean == null ? 0.0 : (mean - 1) * 100;
+
+    // The accumulator is cleared however this turns out. Once a correction has
+    // been applied - or declined - the readings behind it describe fuelling
+    // the engine no longer has.
+    cell.weight = 0;
+    cell.weightedRatio = 0;
+    if (mean == null) return false;
+
+    // An error the storage could not represent even if it were applied is not
+    // an error. Without this, floating-point noise on a perfectly on-target
+    // sample reads as a change to the tune.
+    if (wanted.abs() < _deadbandPercent(cell.baseline)) return false;
+
+    final step = wanted.clamp(-maxStep, maxStep);
+    final next = (cell.appliedPercent + step)
+        .clamp(-settings.maxTotalPercent, settings.maxTotalPercent);
+    if (next == cell.appliedPercent) return false;
+
+    cell.appliedPercent = next;
+    final before = table.rawAt(key.row, key.column);
+    table.setValueAt(key.row, key.column, cell.baseline * (1 + next / 100));
+    return table.rawAt(key.row, key.column) != before;
+  }
+
+  /// The smallest correction worth making, as a percentage of [baseline].
+  ///
+  /// Half of what one step of the table's storage represents: below that, the
+  /// value written back would be the value already there.
+  double _deadbandPercent(double baseline) {
+    if (baseline == 0) return 0;
+    return (table.zStep / 2) / baseline.abs() * 100;
+  }
+}
