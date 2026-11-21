@@ -44,7 +44,7 @@ void main() {
         writeModeEnabled: false,
       );
       expect(permission.allowed, isFalse);
-      expect(permission.reason, contains('Write mode is off'));
+      expect(permission.reason, contains('Режим записи выключен'));
     });
 
     test('refuses on a signature mismatch', () {
@@ -55,7 +55,7 @@ void main() {
         writeModeEnabled: true,
       );
       expect(permission.allowed, isFalse);
-      expect(permission.reason, contains('cannot be trusted'));
+      expect(permission.reason, contains('Смещениям страниц доверять нельзя'));
     });
 
     test('refuses when the ECU reported nothing', () {
