@@ -454,7 +454,7 @@ class _LogReplayScreenState extends ConsumerState<LogReplayScreen> {
             for (final reason in reasons)
               ListTile(
                 dense: true,
-                title: Text(reason.key),
+                title: Text(_skipReasonLabel(reason.key)),
                 trailing: Text('${reason.value}'),
               ),
           ],
@@ -518,6 +518,17 @@ class _LogPicker extends ConsumerWidget {
     );
   }
 }
+
+String _skipReasonLabel(String key) => switch (key) {
+  'Settling' => 'Успокоение',
+  'Table since changed' => 'Таблица с тех пор изменилась',
+  'Off the table' => 'За пределами таблицы',
+  'Implausible mixture' => 'Недостоверное показание смеси',
+  'Custom filter' => 'Пользовательский фильтр',
+  'No time' => 'Нет времени',
+  'Unusable' => 'Непригодная строка',
+  _ => key,
+};
 
 class _Notice extends StatelessWidget {
   const _Notice({required this.text, this.warning = false});
