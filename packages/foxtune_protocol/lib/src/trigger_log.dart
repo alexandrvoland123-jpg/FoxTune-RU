@@ -120,7 +120,7 @@ class TriggerLog {
     final buffer = StringBuffer();
     if (header) {
       buffer.writeln([
-        if (capture != null) 'Захват',
+        if (capture != null) 'Capture',
         for (final field in fields) _csvCell(field.label),
       ].join(','));
     }

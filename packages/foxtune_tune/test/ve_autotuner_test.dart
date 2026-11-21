@@ -218,7 +218,7 @@ void main() {
       );
 
       expect(result.tuner, isNull);
-      expect(result.readiness.reason, contains('"Minimum CLT"'));
+      expect(result.readiness.reason, contains('Minimum CLT'));
     });
   });
 

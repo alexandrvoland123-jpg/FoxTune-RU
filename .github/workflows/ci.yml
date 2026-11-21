@@ -71,7 +71,6 @@ jobs:
     name: Build Windows
     runs-on: windows-latest
     timeout-minutes: 35
-    needs: [core, flutter]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
@@ -108,7 +107,6 @@ jobs:
     name: Build Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [core, flutter]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 

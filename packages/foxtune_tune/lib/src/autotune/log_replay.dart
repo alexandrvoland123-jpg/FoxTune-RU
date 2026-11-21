@@ -132,7 +132,7 @@ abstract final class LogReplay {
     for (final channel in {...axes, config.measuredChannel}) {
       if (!_everRead(channels, channel)) {
         return blocked(
-          'Ни в одной строке этого журнала нет показания «$channel», которое нужно автонастройке.'
+          'Ни в одной строке этого журнала нет показания «$channel» ("$channel"), которое нужно автонастройке.'
           '',
         );
       }
@@ -151,7 +151,7 @@ abstract final class LogReplay {
     for (var row = 0; row < log.rowCount; row++) {
       final seconds = log.valueAt(row, time);
       if (seconds == null) {
-        skip('Без времени');
+        skip('No time');
         continue;
       }
       // Across a break the engine may have been anywhere, so it has to be
@@ -220,17 +220,18 @@ abstract final class LogReplay {
   /// are named here.
   static String _reasonFor(AutotuneOutcome outcome) {
     final filter = outcome.rejectedBy;
-    if (filter == null) return outcome.detail ?? 'Непригодно';
-    if (filter.label.isNotEmpty) return filter.label;
+    if (filter == null) return outcome.detail ?? 'Unusable';
+    // Stable keys belong in the result model; the UI translates them.
     return switch (filter.id) {
+      'std_Settling' => 'Settling',
+      'std_RunningVe' => 'Table since changed',
       'std_xAxisMin' ||
       'std_xAxisMax' ||
       'std_yAxisMin' ||
-      'std_yAxisMax' =>
-        'За пределами таблицы',
-      'std_DeadLambda' => VeAutotuner.deadSensorFilter.label,
-      'std_Custom' => 'Пользовательский фильтр',
-      _ => filter.displayLabel,
+      'std_yAxisMax' => 'Off the table',
+      'std_DeadLambda' => 'Implausible mixture',
+      'std_Custom' => 'Custom filter',
+      _ => filter.label.isNotEmpty ? filter.label : filter.displayLabel,
     };
   }
 
@@ -256,8 +257,9 @@ abstract final class LogReplay {
           TemperatureScale.of(_unitsOf(channels.definition, channel));
       if (expected == null || expected == logged) continue;
 
-      String name(TemperatureScale scale) =>
-          scale == TemperatureScale.celsius ? 'Цельсий' : 'Фаренгейт';
+      String name(TemperatureScale scale) => scale == TemperatureScale.celsius
+          ? 'Цельсий (Celsius)'
+          : 'Фаренгейт (Fahrenheit)';
       return 'Этот журнал записывает температуры в ${name(logged)}, а определение читается в ${name(expected)}, поэтому его температурные фильтры оценивались бы в неверной шкале. Переключите температурную шкалу на ${name(logged)}, чтобы воспроизвести его.'
           ''
           ''
