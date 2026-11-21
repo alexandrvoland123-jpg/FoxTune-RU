@@ -46,8 +46,10 @@ class TcpEcuTransport implements IsolateTransport {
     try {
       return await SocketEcuLink.connect(host, tcpPort);
     } on Object catch (error) {
-      throw EcuTransportException('Не удалось связаться с $host:$tcpPort — $error',
-          port: port);
+      throw EcuTransportException(
+        'Не удалось связаться с $host:$tcpPort — $error',
+        port: port,
+      );
     }
   }
 
@@ -65,7 +67,9 @@ class TcpEcuTransport implements IsolateTransport {
   }
 
   static (String host, int port) parseAddress(
-      String address, int fallbackPort) {
+    String address,
+    int fallbackPort,
+  ) {
     final trimmed = address.trim();
 
     if (trimmed.startsWith('[')) {
