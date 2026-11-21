@@ -1,3 +1,4 @@
+
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -7,7 +8,6 @@ import 'package:foxtune_transport/foxtune_transport.dart';
 void main() {
   group('USB permission', () {
     test('a denial reads as a denial, not as a bug', () {
-      // What the plugin actually sends when the user taps "Deny".
       final message = UsbSerialTransport.describeOpenFailure(
         PlatformException(
           code: 'UsbSerialPortAdapter',
@@ -15,8 +15,8 @@ void main() {
         ),
       );
 
-      expect(message, startsWith('USB permission was denied'));
-      expect(message, contains('always'));
+      expect(message, startsWith('Доступ к USB отклонён'));
+      expect(message, contains('всегда'));
     });
 
     test('any other failure keeps the plugin detail', () {
@@ -24,15 +24,15 @@ void main() {
         PlatformException(code: 'x', message: 'Interface busy'),
       );
 
-      expect(message, 'Could not claim the USB device: Interface busy');
+      expect(
+        message,
+        'Не удалось получить доступ к USB-устройству: Interface busy',
+      );
     });
   });
 
   group('device filter', () {
     test('lists exactly the vendors the port picker treats as likely ECUs', () {
-      // Plugging in a board whose vendor is missing from the XML would not
-      // offer to open FoxTune; one whose vendor is missing from the Dart set
-      // would sort to the bottom of the picker. Either is a quiet mismatch.
       final file = [
         File('../../app/foxtune_app/android/app/src/main/res/xml/'
             'device_filter.xml'),
